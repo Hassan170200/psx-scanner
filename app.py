@@ -1,14 +1,15 @@
-"""PSX Live Scanner - live prices, rule-based setups, trade plans and Telegram alerts."""
+"""PSX Live Scanner - live prices, rule-based setups, trade plans and phone alerts."""
 from __future__ import annotations
 
 import time
+import uuid
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 
-from alerts import Engine, Position, find_chat_ids, market_open, send_telegram, send_whatsapp
+from alerts import Engine, Position, market_open, send_ntfy, send_whatsapp
 from signals import Costs, Settings, build_scan
 
 PKT = ZoneInfo("Asia/Karachi")
@@ -21,6 +22,11 @@ def engine() -> Engine:
     e = Engine(interval=60)
     e.start()
     return e
+
+
+@st.cache_resource
+def suggested_topic() -> str:
+    return f"psx-hassan-{uuid.uuid4().hex[:10]}"
 
 
 def secret(name: str) -> str:
@@ -63,39 +69,27 @@ with st.sidebar:
 
     st.divider()
     st.subheader("📲 Phone alerts")
-    tg_token, tg_chat = secret("TELEGRAM_TOKEN"), secret("TELEGRAM_CHAT_ID")
+    ntfy_topic = secret("NTFY_TOPIC")
     wa_phone, wa_key = secret("WHATSAPP_PHONE"), secret("WHATSAPP_APIKEY")
     buy_when_holding = st.toggle("Buy alerts while I hold a position", value=False,
                                  help="Off = one position at a time: no new buy alerts until you sell.")
-    st.markdown("**WhatsApp**")
-    if wa_phone and wa_key:
+    st.markdown("**ntfy push** (main)")
+    if ntfy_topic:
         st.success("Connected. Alerts run in the background, even with this page closed.")
+        if st.button("Send test push"):
+            ok, msg = send_ntfy(ntfy_topic, "✅ <b>PSX Scanner test alert</b>\nPush notifications are working.")
+            (st.toast if ok else st.error)("Test sent. Check the ntfy app." if ok else msg)
+    else:
+        st.info("Not set up yet. See README → ntfy alerts. Your private channel name:")
+        st.code(suggested_topic(), language=None)
+    st.markdown("**WhatsApp** (optional)")
+    if wa_phone and wa_key:
+        st.success("Connected.")
         if st.button("Send test WhatsApp"):
             ok, msg = send_whatsapp(wa_phone, wa_key, "✅ <b>PSX Scanner</b> test alert. WhatsApp notifications are working.")
             (st.toast if ok else st.error)("Test sent. Check WhatsApp." if ok else msg)
     else:
-        st.info("Not set up yet. See README → WhatsApp alerts.")
-    st.markdown("**Telegram**")
-    if tg_token and tg_chat:
-        st.success("Connected. Alerts run in the background, even with this page closed.")
-        if st.button("Send test alert"):
-            ok, msg = send_telegram(tg_token, tg_chat, "✅ PSX Scanner test alert. Notifications are working.")
-            (st.toast if ok else st.error)("Test alert sent. Check Telegram." if ok else msg)
-    elif tg_token:
-        st.warning("Bot token found. Now send any message to your bot in Telegram, then:")
-        if st.button("Find my chat ID"):
-            try:
-                ids = find_chat_ids(tg_token)
-                if ids:
-                    for cid, name in ids:
-                        st.code(f'TELEGRAM_CHAT_ID = "{cid}"', language="toml")
-                        st.caption(f"Chat: {name}. Add this line to the app's Secrets.")
-                else:
-                    st.info("No messages yet. Send 'hi' to your bot, then try again.")
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Couldn't reach Telegram: {e}")
-    else:
-        st.info("Not set up yet. See README → Telegram alerts.")
+        st.caption("Not set up. Optional, see README → WhatsApp alerts.")
     st.caption(f"Background scanner: {'running' if eng.running else 'stopped'}"
                + (f" · last scan {eng.last_tick}" if eng.last_tick else ""))
 
@@ -104,7 +98,7 @@ cfg = Settings(capital=capital, position_pct=position_pct, stop_pct=stop_pct, re
 costs = Costs(commission_rate=comm, min_comm_per_share=comm_min, sales_tax=stax, cgt=cgt)
 # The latest settings drive the background alerts
 eng.config = {"settings": cfg, "costs": costs, "kse_only": kse_only, "open_t": open_t,
-              "close_t": close_t, "tg_token": tg_token, "tg_chat": tg_chat,
+              "close_t": close_t, "ntfy_topic": ntfy_topic,
               "wa_phone": wa_phone, "wa_key": wa_key, "buy_when_holding": buy_when_holding}
 
 st.title("📈 PSX Live Scanner")
@@ -297,7 +291,7 @@ with st.expander("How the signals and alerts work"):
   **Target**: {rr}× the risk.
 - **Costs**: commission max(Rs {comm_min:.2f}/share, {comm:.2%}) + {stax:.0%} sales tax, exchange/CDC fees,
   and {cgt:.0%} capital gains tax on profit.
-- **Alerts** (WhatsApp and/or Telegram, checked every minute in market hours): new buy setups (max 3 per scan, once per stock
+- **Alerts** (ntfy push and/or WhatsApp, checked every minute in market hours): new buy setups (max 3 per scan, once per stock
   per day, paused while you hold a position unless you switch that on); for your position: stop hit → sell,
   target hit → sell, up 1× risk → move stop to breakeven, and 15 minutes before the close.
 - The background scanner runs while the app is awake. Open the site once each morning to wake it.
