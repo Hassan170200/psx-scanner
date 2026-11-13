@@ -40,6 +40,38 @@ def send_telegram(token: str, chat_id: str, text: str) -> tuple[bool, str]:
         return False, f"Telegram unreachable: {e.__class__.__name__}"
 
 
+def to_whatsapp(text: str) -> str:
+    return text.replace("<b>", "*").replace("</b>", "*")
+
+
+def send_whatsapp(phone: str, apikey: str, text: str) -> tuple[bool, str]:
+    """Free personal WhatsApp gateway (CallMeBot): messages go only to your own number."""
+    if not phone or not apikey:
+        return False, "WhatsApp not set up"
+    try:
+        r = requests.get("https://api.callmebot.com/whatsapp.php",
+                         params={"phone": phone, "text": to_whatsapp(text), "apikey": apikey}, timeout=25)
+        body = r.text.lower()[:500]
+        ok = r.status_code == 200 and "error" not in body and "invalid" not in body
+        return ok, "sent" if ok else f"WhatsApp error {r.status_code}: {r.text[:200]}"
+    except requests.RequestException as e:
+        return False, f"WhatsApp unreachable: {e.__class__.__name__}"
+
+
+def notify(cfg: dict, text: str) -> list[str]:
+    """Send to every channel that is set up. Returns problems (empty list = all sent)."""
+    problems = []
+    if cfg.get("tg_token") and cfg.get("tg_chat"):
+        ok, msg = send_telegram(cfg["tg_token"], cfg["tg_chat"], text)
+        if not ok:
+            problems.append(msg)
+    if cfg.get("wa_phone") and cfg.get("wa_key"):
+        ok, msg = send_whatsapp(cfg["wa_phone"], cfg["wa_key"], text)
+        if not ok:
+            problems.append(msg)
+    return problems
+
+
 def find_chat_ids(token: str) -> list[tuple[str, str]]:
     """Chats that recently messaged the bot: [(chat_id, name)]."""
     r = requests.get(f"https://api.telegram.org/bot{token}/getUpdates", timeout=15)
@@ -271,9 +303,8 @@ class Engine:
             if any(a.kind == "breakeven" for a in alerts):
                 self.save_positions()
         for a in alerts:
-            ok, msg = send_telegram(cfg.get("tg_token", ""), cfg.get("tg_chat", ""), a.text)
-            if not ok:
-                log.warning("alert %s not sent: %s", a.key, msg)
+            for problem in notify(cfg, a.text):
+                log.warning("alert %s: %s", a.key, problem)
             with self.lock:
                 self.sent.add(a.key)
                 self.log.append(a)
