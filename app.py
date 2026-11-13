@@ -38,6 +38,10 @@ def secret(name: str) -> str:
 
 
 eng = engine()
+if getattr(eng, "VERSION", 0) != Engine.VERSION:  # code updated while the app was running
+    eng.config = None  # silences the outdated engine's background thread
+    engine.clear()
+    eng = engine()
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
