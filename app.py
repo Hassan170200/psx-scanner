@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from alerts import Engine, Position, find_chat_ids, market_open, send_telegram
+from alerts import Engine, Position, find_chat_ids, market_open, send_telegram, send_whatsapp
 from signals import Costs, Settings, build_scan
 
 PKT = ZoneInfo("Asia/Karachi")
@@ -62,10 +62,20 @@ with st.sidebar:
         cgt = st.number_input("Capital gains tax (%)", 0.0, 30.0, 15.0, 1.0) / 100
 
     st.divider()
-    st.subheader("📲 Telegram alerts")
+    st.subheader("📲 Phone alerts")
     tg_token, tg_chat = secret("TELEGRAM_TOKEN"), secret("TELEGRAM_CHAT_ID")
+    wa_phone, wa_key = secret("WHATSAPP_PHONE"), secret("WHATSAPP_APIKEY")
     buy_when_holding = st.toggle("Buy alerts while I hold a position", value=False,
                                  help="Off = one position at a time: no new buy alerts until you sell.")
+    st.markdown("**WhatsApp**")
+    if wa_phone and wa_key:
+        st.success("Connected. Alerts run in the background, even with this page closed.")
+        if st.button("Send test WhatsApp"):
+            ok, msg = send_whatsapp(wa_phone, wa_key, "✅ <b>PSX Scanner</b> test alert. WhatsApp notifications are working.")
+            (st.toast if ok else st.error)("Test sent. Check WhatsApp." if ok else msg)
+    else:
+        st.info("Not set up yet. See README → WhatsApp alerts.")
+    st.markdown("**Telegram**")
     if tg_token and tg_chat:
         st.success("Connected. Alerts run in the background, even with this page closed.")
         if st.button("Send test alert"):
@@ -95,7 +105,7 @@ costs = Costs(commission_rate=comm, min_comm_per_share=comm_min, sales_tax=stax,
 # The latest settings drive the background alerts
 eng.config = {"settings": cfg, "costs": costs, "kse_only": kse_only, "open_t": open_t,
               "close_t": close_t, "tg_token": tg_token, "tg_chat": tg_chat,
-              "buy_when_holding": buy_when_holding}
+              "wa_phone": wa_phone, "wa_key": wa_key, "buy_when_holding": buy_when_holding}
 
 st.title("📈 PSX Live Scanner")
 st.caption("Live PSX prices → rule-based setups → full trade plan with costs and tax. "
@@ -287,7 +297,7 @@ with st.expander("How the signals and alerts work"):
   **Target**: {rr}× the risk.
 - **Costs**: commission max(Rs {comm_min:.2f}/share, {comm:.2%}) + {stax:.0%} sales tax, exchange/CDC fees,
   and {cgt:.0%} capital gains tax on profit.
-- **Alerts** (Telegram, checked every minute in market hours): new buy setups (max 3 per scan, once per stock
+- **Alerts** (WhatsApp and/or Telegram, checked every minute in market hours): new buy setups (max 3 per scan, once per stock
   per day, paused while you hold a position unless you switch that on); for your position: stop hit → sell,
   target hit → sell, up 1× risk → move stop to breakeven, and 15 minutes before the close.
 - The background scanner runs while the app is awake. Open the site once each morning to wake it.
