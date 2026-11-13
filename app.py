@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from alerts import Engine, Position, market_open, send_ntfy, send_whatsapp
+from broker_calls import evaluate as evaluate_call, parse_message, track_record
 from signals import Costs, Settings, build_scan
 
 PKT = ZoneInfo("Asia/Karachi")
@@ -68,6 +69,11 @@ with st.sidebar:
         cgt = st.number_input("Capital gains tax (%)", 0.0, 30.0, 15.0, 1.0) / 100
 
     st.divider()
+    st.subheader("📣 Broker calls")
+    calls_url = secret("BROKER_CALLS_URL")
+    risk_budget = st.number_input("Max loss per broker call (Rs)", 200, 20_000, 1_300, 100,
+                                  help="Each broker call is sized so hitting its stop loses about this much.")
+    st.divider()
     st.subheader("📲 Phone alerts")
     ntfy_topic = secret("NTFY_TOPIC")
     wa_phone, wa_key = secret("WHATSAPP_PHONE"), secret("WHATSAPP_APIKEY")
@@ -98,7 +104,7 @@ cfg = Settings(capital=capital, position_pct=position_pct, stop_pct=stop_pct, re
 costs = Costs(commission_rate=comm, min_comm_per_share=comm_min, sales_tax=stax, cgt=cgt)
 # The latest settings drive the background alerts
 eng.config = {"settings": cfg, "costs": costs, "kse_only": kse_only, "open_t": open_t,
-              "close_t": close_t, "ntfy_topic": ntfy_topic,
+              "close_t": close_t, "ntfy_topic": ntfy_topic, "calls_url": calls_url,
               "wa_phone": wa_phone, "wa_key": wa_key, "buy_when_holding": buy_when_holding}
 
 st.title("📈 PSX Live Scanner")
@@ -112,6 +118,74 @@ def get_board() -> pd.DataFrame | None:
     if not eng.avg_vol:
         eng.refresh_reference()
     return eng.board
+
+
+def broker_section(prices: dict) -> None:
+    st.subheader("📣 Broker calls")
+    if not calls_url:
+        st.info("Broker calls aren't connected yet. Add BROKER_CALLS_URL to the app's Secrets (see README).")
+    c1, c2 = st.columns([1, 3])
+    if c1.button("🔄 Update now", help="Reload the latest calls and recheck prices and history now."):
+        eng.refresh_calls(calls_url, force=True)
+        for c in eng.all_calls():
+            eng.history(c["symbol"], force=True)
+        st.toast("Broker calls updated.")
+    else:
+        eng.refresh_calls(calls_url)
+    upd = eng.calls_updated or "never"
+    c2.caption(f"Calls file last updated by Claude: {upd}. Claude reads the WhatsApp channels hourly "
+               "on market days (9:40 am–3:40 pm). Use Update now to reload, or paste a call below.")
+    if eng.calls_error:
+        st.warning(f"Couldn't load the calls file: {eng.calls_error}")
+    with st.expander("➕ Paste a call from WhatsApp"):
+        txt = st.text_area("Paste the broker's message", height=140, key="paste_call")
+        src = st.selectbox("Source", ["Nadeem Chawla-PSX", "KTrade", "Other"], key="paste_src")
+        if st.button("Add call"):
+            call = parse_message(txt, source=src)
+            if call:
+                eng.add_pasted(call)
+                st.success(f"Added {call['symbol']}: buy {call['entry_low']}–{call['entry_high']}, "
+                           f"SL {call['stop']}, targets {call['targets']}")
+            else:
+                st.error("Couldn't find a symbol with a stop-loss or target in that message.")
+
+    calls = sorted(eng.all_calls(), key=lambda c: c.get("date", ""), reverse=True)[:15]
+    if not calls:
+        st.caption("No calls yet. New calls from Monday 16 Nov will appear here.")
+        return
+    evals = []
+    for c in calls:
+        ev = evaluate_call(c, prices.get(c["symbol"]), eng.history(c["symbol"]), costs, risk_budget)
+        evals.append(ev)
+        with st.container(border=True):
+            tps = " / ".join(f"{t:g}" for t in c.get("targets") or [])
+            h1, h2 = st.columns([3, 2])
+            h1.markdown(f"**{c['symbol']}** · {c.get('source', '')} · {c.get('date', '')} · "
+                        f"{c.get('timeframe') or ''}")
+            h2.markdown(f"**{ev.get('verdict', '')}**")
+            st.caption(f"Buy {c.get('entry_low')}–{c.get('entry_high')} · Stop {c.get('stop')} · Targets {tps}")
+            m = st.columns(4)
+            m[0].metric("Now", f"{ev['price']:,.2f}" if ev.get("price") else "–", ev.get("status"),
+                        delta_color="off", delta_arrow="off")
+            m[1].metric("Since call", ev.get("outcome", "–"))
+            if ev.get("shares"):
+                m[2].metric("Size for your risk", f"{ev['shares']:,} sh", f"Rs {ev['position_rs']:,.0f}",
+                            delta_color="off", delta_arrow="off")
+                last = ev.get("net_last")
+                m[3].metric("Win / loss (Rs)", f"{ev.get('net_tp1', 0):+,.0f}",
+                            f"final {last:+,.0f} · stop {ev['loss_at_stop']:,.0f}" if last is not None
+                            else f"stop {ev['loss_at_stop']:,.0f}", delta_color="off", delta_arrow="off")
+            for f in ev.get("flags", []):
+                st.caption(f"• {f}")
+            if c.get("claude_note"):
+                st.markdown(f"🧠 *{c['claude_note']}*")
+            if c in eng.pasted and st.button("Remove", key=f"rm-{c['id']}"):
+                eng.remove_pasted(c["id"])
+                st.rerun()
+    tr = track_record(evals)
+    if tr["closed"]:
+        st.caption(f"Track record of these calls: {tr['closed']} finished: {tr['wins']} hit a target, "
+                   f"{tr['partial']} hit a target then stopped, {tr['losses']} stopped out.")
 
 
 # ---------------------------------------------------------------- live section
@@ -196,6 +270,8 @@ def live() -> None:
                 eng.add_position(Position(sym, entry, int(shares), stop, target,
                                           opened=now.strftime("%Y-%m-%d %H:%M")))
                 st.rerun()
+
+    broker_section(prices)
 
     if scan.empty:
         st.warning("No stocks pass your filters. Try lowering min volume or turning off KSE-100 only.")
