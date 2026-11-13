@@ -57,6 +57,19 @@ Uses CallMeBot, a free gateway that can only message your own WhatsApp number. I
 
 When ntfy and WhatsApp are both set up, every alert goes to both.
 
+## Broker calls panel
+
+Shows trade calls from your broker's WhatsApp channels with a sense check: live status (waiting, in buy zone, target or stop hit), what happened since the call (from PSX daily history), a position size that keeps one stop-out near your chosen max loss, profit and loss after KTrade costs and tax, and warning flags.
+
+- **Data:** a secret GitHub gist (`calls.json`) that Claude updates hourly on market days by reading the WhatsApp channels in your Chrome. Your computer must be awake with Chrome open for those updates.
+- **Connect it once:** in Streamlit Secrets add
+  ```
+  BROKER_CALLS_URL = "https://gist.githubusercontent.com/<you>/<gist-id>/raw/calls.json"
+  ```
+- **Update now** reloads the file and rechecks prices and history straight away.
+- **Paste a call:** copy a broker message from WhatsApp and paste it to add it instantly.
+- Push alerts: a new call appears, the price enters the buy zone, TP1 is hit, or the stop is hit.
+
 ## If it says "Couldn't reach the PSX data portal"
 
 Streamlit's servers are outside Pakistan, and PSX may block them. If the error keeps happening during market hours, run the same app on your laptop instead:
