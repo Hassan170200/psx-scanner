@@ -1,7 +1,6 @@
-"""PSX Live Scanner - live prices, rule-based setups and full-capital trade plans."""
+"""PSX Live Scanner - live prices, rule-based setups, trade plans and Telegram alerts."""
 from __future__ import annotations
 
-import threading
 import time
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -9,82 +8,29 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from psx_client import PSXClient, PSXError
-from signals import ACTIONABLE, Costs, Settings, build_scan, session_vwap
+from alerts import Engine, Position, find_chat_ids, market_open, send_telegram
+from signals import Costs, Settings, build_scan
 
 PKT = ZoneInfo("Asia/Karachi")
 st.set_page_config(page_title="PSX Live Scanner", page_icon="📈", layout="wide")
 
 
-# ---------------------------------------------------------------- data layer
 @st.cache_resource
-def client() -> PSXClient:
-    return PSXClient()
+def engine() -> Engine:
+    """One background engine per server: scans, records VWAP and sends alerts."""
+    e = Engine(interval=60)
+    e.start()
+    return e
 
 
-@st.cache_resource
-def snapshot_store() -> dict:
-    """Intraday price/volume snapshots, shared by every visitor of this app."""
-    return {"day": None, "snaps": {}, "lock": threading.Lock()}
-
-
-@st.cache_data(ttl=50, show_spinner=False)
-def load_board() -> pd.DataFrame:
-    return client().market_watch()
-
-
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def load_avg_volume() -> dict:
+def secret(name: str) -> str:
     try:
-        sc = client().screener()
-        if {"symbol", "volume_avg_30d"} <= set(sc.columns):
-            return dict(zip(sc["symbol"], sc["volume_avg_30d"]))
-    except PSXError:
-        pass
-    return {}
+        return str(st.secrets.get(name, "") or "")
+    except Exception:  # no secrets file
+        return ""
 
 
-@st.cache_data(ttl=12 * 3600, show_spinner=False)
-def load_kse100() -> set:
-    try:
-        return set(client().index_members("KSE100"))
-    except PSXError:
-        return set()
-
-
-def record_snapshots(board: pd.DataFrame) -> None:
-    store = snapshot_store()
-    today = datetime.now(PKT).date()
-    now = time.time()
-    with store["lock"]:
-        if store["day"] != today:
-            store["day"], store["snaps"] = today, {}
-        for sym, px, vol in zip(board["symbol"], board["current"], board.get("volume", pd.Series(0, index=board.index))):
-            if pd.isna(px) or pd.isna(vol):
-                continue
-            series = store["snaps"].setdefault(sym, [])
-            if not series or vol != series[-1][2]:
-                series.append((now, float(px), float(vol)))
-
-
-def current_vwaps() -> dict:
-    store = snapshot_store()
-    with store["lock"]:
-        return {s: v for s, snaps in store["snaps"].items() if (v := session_vwap(snaps))}
-
-
-def session_fraction(open_t: dtime, close_t: dtime) -> tuple[float, bool]:
-    now = datetime.now(PKT)
-    if now.weekday() >= 5:
-        return 1.0, False
-    start = now.replace(hour=open_t.hour, minute=open_t.minute, second=0, microsecond=0)
-    end = now.replace(hour=close_t.hour, minute=close_t.minute, second=0, microsecond=0)
-    if now < start:
-        return 1.0, False
-    if now > end:
-        return 1.0, False
-    return (now - start) / (end - start), True
-
+eng = engine()
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
@@ -101,7 +47,7 @@ with st.sidebar:
     lot = st.number_input("Lot size (shares)", 1, 10_000, 1, 1,
                           help="Set to your broker's minimum lot if it isn't 1.")
     st.divider()
-    refresh = st.select_slider("Auto-refresh every", options=[30, 60, 120, 300], value=60,
+    refresh = st.select_slider("Page refresh every", options=[30, 60, 120, 300], value=60,
                                format_func=lambda s: f"{s} sec")
     with st.expander("Market hours (PKT)"):
         open_t = st.time_input("Opens", dtime(9, 30))
@@ -115,53 +61,137 @@ with st.sidebar:
         stax = st.number_input("Sales tax on commission (%)", 0.0, 20.0, 16.0, 1.0) / 100
         cgt = st.number_input("Capital gains tax (%)", 0.0, 30.0, 15.0, 1.0) / 100
 
+    st.divider()
+    st.subheader("📲 Telegram alerts")
+    tg_token, tg_chat = secret("TELEGRAM_TOKEN"), secret("TELEGRAM_CHAT_ID")
+    buy_when_holding = st.toggle("Buy alerts while I hold a position", value=False,
+                                 help="Off = one position at a time: no new buy alerts until you sell.")
+    if tg_token and tg_chat:
+        st.success("Connected. Alerts run in the background, even with this page closed.")
+        if st.button("Send test alert"):
+            ok, msg = send_telegram(tg_token, tg_chat, "✅ PSX Scanner test alert. Notifications are working.")
+            (st.toast if ok else st.error)("Test alert sent. Check Telegram." if ok else msg)
+    elif tg_token:
+        st.warning("Bot token found. Now send any message to your bot in Telegram, then:")
+        if st.button("Find my chat ID"):
+            try:
+                ids = find_chat_ids(tg_token)
+                if ids:
+                    for cid, name in ids:
+                        st.code(f'TELEGRAM_CHAT_ID = "{cid}"', language="toml")
+                        st.caption(f"Chat: {name}. Add this line to the app's Secrets.")
+                else:
+                    st.info("No messages yet. Send 'hi' to your bot, then try again.")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Couldn't reach Telegram: {e}")
+    else:
+        st.info("Not set up yet. See README → Telegram alerts.")
+    st.caption(f"Background scanner: {'running' if eng.running else 'stopped'}"
+               + (f" · last scan {eng.last_tick}" if eng.last_tick else ""))
+
 cfg = Settings(capital=capital, position_pct=position_pct, stop_pct=stop_pct, reward_risk=rr,
                min_price=min_price, min_volume=min_volume, lot_size=int(lot))
 costs = Costs(commission_rate=comm, min_comm_per_share=comm_min, sales_tax=stax, cgt=cgt)
+# The latest settings drive the background alerts
+eng.config = {"settings": cfg, "costs": costs, "kse_only": kse_only, "open_t": open_t,
+              "close_t": close_t, "tg_token": tg_token, "tg_chat": tg_chat,
+              "buy_when_holding": buy_when_holding}
 
 st.title("📈 PSX Live Scanner")
 st.caption("Live PSX prices → rule-based setups → full trade plan with costs and tax. "
            "Signals are screens, not predictions. You decide every trade.")
 
 
+def get_board() -> pd.DataFrame | None:
+    if eng.board is None or time.time() - eng.board_at > 150:
+        eng.fetch_board()
+    if not eng.avg_vol:
+        eng.refresh_reference()
+    return eng.board
+
+
 # ---------------------------------------------------------------- live section
 @st.fragment(run_every=refresh)
 def live() -> None:
-    frac, is_open = session_fraction(open_t, close_t)
-    try:
-        board = load_board()
-    except PSXError as e:
+    now = datetime.now(PKT)
+    is_open = market_open(now, open_t, close_t)
+    board = get_board()
+    if board is None:
         st.error(
             "Couldn't reach the PSX data portal from this server.\n\n"
-            f"Details: {e}\n\n"
+            f"Details: {eng.board_error}\n\n"
             "If this keeps happening on Streamlit Cloud, PSX may be blocking foreign servers. "
             "Run the same app on your laptop instead (see README)."
         )
         return
 
-    if is_open:
-        record_snapshots(board)
-    vwaps = current_vwaps()
-    scan = build_scan(board, load_avg_volume(), load_kse100(), vwaps, frac, cfg, costs, kse_only)
+    vwaps = eng.vwaps()
+    scan = build_scan(board, eng.avg_vol, eng.kse100, vwaps,
+                      eng.session_fraction(now, open_t, close_t), cfg, costs, kse_only)
+    prices = dict(zip(board["symbol"], board["current"]))
 
-    now = datetime.now(PKT).strftime("%a %d %b, %I:%M:%S %p")
-    if "ldcp" in board.columns:
-        moves = board["current"] - board["ldcp"]
-    else:
-        moves = board.get("change", pd.Series(dtype=float))
-    up, down = int((moves > 0).sum()), int((moves < 0).sum())
+    # toasts for alerts the background engine sent since this browser last looked
+    seen = st.session_state.setdefault("seen_alerts", {a.key + a.at for a in eng.log})
+    for a in eng.log:
+        if a.key + a.at not in seen:
+            st.toast(a.text.split("\n")[0].replace("<b>", "").replace("</b>", ""), icon="🔔")
+            seen.add(a.key + a.at)
+
+    moves = board["current"] - board["ldcp"] if "ldcp" in board.columns else board.get("change", pd.Series(dtype=float))
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Market", "OPEN" if is_open else "CLOSED")
-    c2.metric("Stocks up / down", f"{up} / {down}")
+    c2.metric("Stocks up / down", f"{int((moves > 0).sum())} / {int((moves < 0).sum())}")
     c3.metric("Setups right now", int(scan["actionable"].sum()) if not scan.empty else 0)
     c4.metric("VWAP tracking", f"{len(vwaps)} stocks")
-    st.caption(f"Updated {now} PKT · source: dps.psx.com.pk{board.attrs.get('source', '')} · "
-               f"refreshes every {refresh}s")
+    upd = datetime.fromtimestamp(eng.board_at, PKT).strftime("%a %d %b, %I:%M:%S %p")
+    st.caption(f"Prices as of {upd} PKT · source: dps.psx.com.pk{board.attrs.get('source', '')}")
     if not is_open:
         st.info("Market looks closed, so these are the last available prices. "
-                "Setups are most useful during trading hours.")
-    if is_open and len(vwaps) < 10:
-        st.caption("VWAP builds up while the app stays open. Give it ~10 minutes after the open.")
+                "Setups and alerts work during trading hours.")
+
+    # ---- my positions
+    st.subheader("My open position")
+    if eng.positions:
+        for p in list(eng.positions):
+            px = prices.get(p.symbol)
+            with st.container(border=True):
+                if px is None or pd.isna(px):
+                    st.write(f"**{p.symbol}**: no live price right now.")
+                    continue
+                pl = (px - p.entry) * p.shares - costs.per_side(p.shares, p.entry) - costs.per_side(p.shares, px)
+                status = ("🔴 STOP HIT: SELL" if px <= p.stop else "✅ TARGET HIT: SELL" if px >= p.target
+                          else "🟡 Holding")
+                st.markdown(f"### {p.symbol} · {status}")
+                k = st.columns(5)
+                k[0].metric("Now", f"{px:,.2f}", f"{(px / p.entry - 1):+.2%}")
+                k[1].metric("Bought at", f"{p.entry:,.2f}", f"{p.shares:,} shares", delta_color="off",
+                            delta_arrow="off")
+                k[2].metric("Stop-loss", f"{p.stop:,.2f}", "breakeven" if p.breakeven_moved else None,
+                            delta_color="off", delta_arrow="off")
+                k[3].metric("Target", f"{p.target:,.2f}")
+                k[4].metric("P/L now (Rs)", f"{pl:+,.0f}", "after costs, before tax", delta_color="off",
+                            delta_arrow="off")
+                if st.button(f"I sold {p.symbol}", key=f"sold-{p.symbol}"):
+                    eng.close_position(p.symbol)
+                    st.rerun()
+    else:
+        st.caption("None. When you buy, press **I bought this** on the setup (or add it below) "
+                   "so the app watches your stop and target and alerts you when to sell.")
+    with st.expander("Add a position manually"):
+        with st.form("add_pos", clear_on_submit=True):
+            f1, f2, f3 = st.columns(3)
+            sym = f1.text_input("Symbol").strip().upper()
+            entry = f2.number_input("Buy price", 0.0, 100_000.0, 0.0, 0.01)
+            shares = f3.number_input("Shares", 0, 10_000_000, 0, 1)
+            f4, f5 = st.columns(2)
+            stop = f4.number_input("Stop-loss (0 = auto)", 0.0, 100_000.0, 0.0, 0.01)
+            target = f5.number_input("Target (0 = auto)", 0.0, 100_000.0, 0.0, 0.01)
+            if st.form_submit_button("Watch this position") and sym and entry > 0 and shares > 0:
+                stop = stop or round(entry * (1 - stop_pct), 2)
+                target = target or round(entry + rr * (entry - stop), 2)
+                eng.add_position(Position(sym, entry, int(shares), stop, target,
+                                          opened=now.strftime("%Y-%m-%d %H:%M")))
+                st.rerun()
 
     if scan.empty:
         st.warning("No stocks pass your filters. Try lowering min volume or turning off KSE-100 only.")
@@ -190,7 +220,13 @@ def live() -> None:
             n[2].metric("Loss at stop (Rs)", f"{r.loss_at_stop:,.0f}", f"{r.loss_at_stop / capital:.1%} of capital",
                         delta_color="red", delta_arrow="off")
             if r.rr_after_costs is not None and r.rr_after_costs < 1.0:
-                st.caption("⚠️ After costs and tax, the profit at target is smaller than the loss at stop. Skip or widen the target.")
+                st.caption("⚠️ After costs and tax, the profit at target is smaller than the loss at stop. "
+                           "Skip or widen the target.")
+            if st.button("✅ I bought this", key=f"buy-{r.symbol}",
+                         help="Watch this trade: alerts at stop, target, breakeven and before the close."):
+                eng.add_position(Position(r.symbol, float(r.entry), int(r.shares), float(r.stop),
+                                          float(r.target), opened=now.strftime("%Y-%m-%d %H:%M")))
+                st.rerun()
 
     # ---- full table
     st.subheader("Scanner")
@@ -213,12 +249,19 @@ def live() -> None:
                      "VWAP": st.column_config.NumberColumn(format="%.2f"),
                  })
 
+    # ---- alerts log
+    if eng.log:
+        st.subheader("Today's alerts")
+        for a in reversed(eng.log[-10:]):
+            st.markdown(f"**{a.at}** · " + a.text.replace("\n", "  \n"), unsafe_allow_html=True)
+
     # ---- chart for one stock
     st.subheader("Intraday chart")
-    sym = st.selectbox("Stock", scan["symbol"].tolist(), index=0, key="chart_sym")
-    store = snapshot_store()
-    with store["lock"]:
-        snaps = list(store["snaps"].get(sym, []))
+    syms = scan["symbol"].tolist()
+    held = [p.symbol for p in eng.positions if p.symbol in syms]
+    sym = st.selectbox("Stock", syms, index=syms.index(held[0]) if held else 0, key="chart_sym")
+    with eng.lock:
+        snaps = list(eng.snaps.get(sym, []))
     if len(snaps) >= 3:
         ch = pd.DataFrame(snaps, columns=["t", "Price", "cumvol"])
         ch["t"] = pd.to_datetime(ch["t"], unit="s", utc=True).dt.tz_convert(PKT)
@@ -227,12 +270,12 @@ def live() -> None:
         ch["VWAP"] = (mid * dv).cumsum() / dv.cumsum()
         st.line_chart(ch.set_index("t")[["Price", "VWAP"]])
     else:
-        st.caption("Not enough snapshots yet for this stock. The chart fills in while the app is open.")
+        st.caption("Not enough snapshots yet for this stock. The chart fills in during market hours.")
 
 
 live()
 
-with st.expander("How the signals work"):
+with st.expander("How the signals and alerts work"):
     st.markdown(
         f"""
 - **Momentum breakout**: up 1–7% today, volume at least 1.5× its normal pace for this time of day,
@@ -244,7 +287,10 @@ with st.expander("How the signals work"):
   **Target**: {rr}× the risk.
 - **Costs**: commission max(Rs {comm_min:.2f}/share, {comm:.2%}) + {stax:.0%} sales tax, exchange/CDC fees,
   and {cgt:.0%} capital gains tax on profit.
-- "Normal" volume = the stock's 30-day average from the PSX screener, scaled to how much of the session has passed.
+- **Alerts** (Telegram, checked every minute in market hours): new buy setups (max 3 per scan, once per stock
+  per day, paused while you hold a position unless you switch that on); for your position: stop hit → sell,
+  target hit → sell, up 1× risk → move stop to breakeven, and 15 minutes before the close.
+- The background scanner runs while the app is awake. Open the site once each morning to wake it.
 """
     )
 st.caption("Not financial advice. Data comes from the public PSX Data Portal and may be delayed or "
