@@ -207,6 +207,8 @@ def evaluate(scan: pd.DataFrame, prices: dict, positions: list[Position], sent: 
 class Engine:
     """Shared state + background loop. One per server process."""
 
+    VERSION = 3  # bump when Engine changes, so a running app swaps in the new one
+
     def __init__(self, client: PSXClient | None = None, interval: int = 60) -> None:
         self.client = client or PSXClient()
         self.interval = interval
