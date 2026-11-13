@@ -58,9 +58,34 @@ def send_whatsapp(phone: str, apikey: str, text: str) -> tuple[bool, str]:
         return False, f"WhatsApp unreachable: {e.__class__.__name__}"
 
 
-def notify(cfg: dict, text: str) -> list[str]:
+NTFY_PRIORITY = {"stop": 5, "target": 4, "breakeven": 4, "close_soon": 4, "buy": 4}
+NTFY_TAGS = {"stop": ["rotating_light"], "target": ["moneybag"], "breakeven": ["shield"],
+             "close_soon": ["alarm_clock"], "buy": ["chart_with_upwards_trend"]}
+
+
+def send_ntfy(topic: str, text: str, kind: str = "test") -> tuple[bool, str]:
+    """Push notification to the free ntfy app (ntfy.sh). Stop-loss alerts go out as urgent."""
+    if not topic:
+        return False, "ntfy not set up"
+    plain = text.replace("<b>", "").replace("</b>", "")
+    title, _, body = plain.partition("\n")
+    try:
+        r = requests.post("https://ntfy.sh/", json={
+            "topic": topic, "title": title, "message": body or title,
+            "priority": NTFY_PRIORITY.get(kind, 3), "tags": NTFY_TAGS.get(kind, [])}, timeout=15)
+        ok = r.status_code == 200
+        return ok, "sent" if ok else f"ntfy error {r.status_code}: {r.text[:200]}"
+    except requests.RequestException as e:
+        return False, f"ntfy unreachable: {e.__class__.__name__}"
+
+
+def notify(cfg: dict, text: str, kind: str = "info") -> list[str]:
     """Send to every channel that is set up. Returns problems (empty list = all sent)."""
     problems = []
+    if cfg.get("ntfy_topic"):
+        ok, msg = send_ntfy(cfg["ntfy_topic"], text, kind)
+        if not ok:
+            problems.append(msg)
     if cfg.get("tg_token") and cfg.get("tg_chat"):
         ok, msg = send_telegram(cfg["tg_token"], cfg["tg_chat"], text)
         if not ok:
@@ -303,7 +328,7 @@ class Engine:
             if any(a.kind == "breakeven" for a in alerts):
                 self.save_positions()
         for a in alerts:
-            for problem in notify(cfg, a.text):
+            for problem in notify(cfg, a.text, a.kind):
                 log.warning("alert %s: %s", a.key, problem)
             with self.lock:
                 self.sent.add(a.key)
