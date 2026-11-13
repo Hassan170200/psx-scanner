@@ -192,6 +192,35 @@ class PSXClient:
         """All listed stocks with 30-day average volume, sector, index membership."""
         return parse_table(self._get("/screener"))
 
+    def history(self, symbol: str) -> pd.DataFrame:
+        """Daily OHLCV for one symbol (all available history), oldest first."""
+        last = ""
+        for attempt in range(3):
+            tok = self._token(force=attempt > 0)
+            hdr = {"X-Requested-With": "XMLHttpRequest",
+                   "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}
+            if tok:
+                hdr["X-Req-Id"] = tok
+            try:
+                r = self.s.post(BASE + "/historical", data={"symbol": symbol}, headers=hdr, timeout=TIMEOUT)
+            except requests.RequestException as e:
+                last = e.__class__.__name__
+                time.sleep(1 + attempt)
+                continue
+            if r.status_code == 200:
+                df = parse_table(r.text)
+                if df.empty or "date" not in df.columns:
+                    return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+                df["date"] = pd.to_datetime(df["date"], format="%b %d, %Y", errors="coerce")
+                for c in ("open", "high", "low", "close", "volume"):
+                    df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ""), errors="coerce")
+                df = df.dropna(subset=["date", "close"])
+                df = df[df["close"] > 0]
+                return df.sort_values("date").reset_index(drop=True)
+            last = f"HTTP {r.status_code}"
+            time.sleep(1 + attempt)
+        raise PSXError(f"PSX history failed for {symbol} ({last})")
+
     def index_members(self, name: str = "KSE100") -> list[str]:
         df = parse_table(self._get(f"/indices/{name}"))
         return df["symbol"].tolist() if "symbol" in df.columns else []
