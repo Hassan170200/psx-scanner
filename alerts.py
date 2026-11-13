@@ -18,12 +18,14 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
+from broker_calls import RISK_BUDGET, evaluate as evaluate_call, load_calls
 from psx_client import PSXClient, PSXError
 from signals import ACTIONABLE, Costs, Settings, build_scan, session_vwap
 
 PKT = ZoneInfo("Asia/Karachi")
 log = logging.getLogger("psx-alerts")
 POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "positions.json")
+PASTED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pasted_calls.json")
 
 
 # ---------------------------------------------------------------- telegram
@@ -58,9 +60,11 @@ def send_whatsapp(phone: str, apikey: str, text: str) -> tuple[bool, str]:
         return False, f"WhatsApp unreachable: {e.__class__.__name__}"
 
 
-NTFY_PRIORITY = {"stop": 5, "target": 4, "breakeven": 4, "close_soon": 4, "buy": 4}
+NTFY_PRIORITY = {"stop": 5, "target": 4, "breakeven": 4, "close_soon": 4, "buy": 4,
+                 "bc_new": 4, "bc_zone": 4, "bc_tp": 3, "bc_stop": 4}
 NTFY_TAGS = {"stop": ["rotating_light"], "target": ["moneybag"], "breakeven": ["shield"],
-             "close_soon": ["alarm_clock"], "buy": ["chart_with_upwards_trend"]}
+             "close_soon": ["alarm_clock"], "buy": ["chart_with_upwards_trend"],
+             "bc_new": ["loudspeaker"], "bc_zone": ["dart"], "bc_tp": ["moneybag"], "bc_stop": ["warning"]}
 
 
 def send_ntfy(topic: str, text: str, kind: str = "test") -> tuple[bool, str]:
@@ -221,6 +225,14 @@ class Engine:
         self.positions: list[Position] = self._load_positions()
         self._thread: threading.Thread | None = None
         self.last_tick = ""
+        # broker calls
+        self.calls: list[dict] = []
+        self.calls_updated = ""
+        self.calls_error = ""
+        self.calls_loaded_at = 0.0
+        self.pasted: list[dict] = self._load_pasted()
+        self.known_calls: set | None = None
+        self.hist_cache: dict = {}
 
     # -- persistence (best effort; Streamlit Cloud wipes files on redeploy)
     def _load_positions(self) -> list[Position]:
@@ -248,6 +260,99 @@ class Engine:
         with self.lock:
             self.positions = [x for x in self.positions if x.symbol != symbol]
             self.save_positions()
+
+    # -- broker calls
+    def _load_pasted(self) -> list[dict]:
+        try:
+            with open(PASTED_FILE) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return []
+
+    def add_pasted(self, call: dict) -> None:
+        with self.lock:
+            self.pasted = [c for c in self.pasted if c["id"] != call["id"]] + [call]
+            try:
+                with open(PASTED_FILE, "w") as f:
+                    json.dump(self.pasted, f)
+            except OSError:
+                pass
+
+    def remove_pasted(self, call_id: str) -> None:
+        with self.lock:
+            self.pasted = [c for c in self.pasted if c["id"] != call_id]
+            try:
+                with open(PASTED_FILE, "w") as f:
+                    json.dump(self.pasted, f)
+            except OSError:
+                pass
+
+    def all_calls(self) -> list[dict]:
+        ids = {c.get("id") for c in self.calls}
+        return list(self.calls) + [c for c in self.pasted if c.get("id") not in ids]
+
+    def refresh_calls(self, url: str, force: bool = False) -> None:
+        if not url or (not force and time.time() - self.calls_loaded_at < 600):
+            return
+        try:
+            calls, updated = load_calls(url)
+            with self.lock:
+                self.calls, self.calls_updated, self.calls_error = calls, updated, ""
+        except Exception as e:  # noqa: BLE001 - show the problem, keep old data
+            with self.lock:
+                self.calls_error = f"{e.__class__.__name__}: {str(e)[:150]}"
+        self.calls_loaded_at = time.time()
+
+    def history(self, symbol: str, force: bool = False):
+        hit = self.hist_cache.get(symbol)
+        if hit and not force and time.time() - hit[0] < 6 * 3600:
+            return hit[1]
+        try:
+            df = self.client.history(symbol)
+        except PSXError:
+            df = hit[1] if hit else None
+        self.hist_cache[symbol] = (time.time(), df)
+        return df
+
+    def broker_alerts(self, prices: dict, costs: Costs, now: datetime) -> list[Alert]:
+        alerts: list[Alert] = []
+        calls = [c for c in self.all_calls()
+                 if c.get("date") and (now.date() - pd.Timestamp(c["date"]).date()).days <= 30]
+        if self.known_calls is None:  # first load after a restart: don't re-announce
+            self.known_calls = {c["id"] for c in calls}
+        for c in calls:
+            sym, cid = c["symbol"], c["id"]
+            px = prices.get(sym)
+            if cid not in self.known_calls:
+                self.known_calls.add(cid)
+                ev = evaluate_call(c, px, self.history(sym), costs, RISK_BUDGET)
+                tps = "/".join(f"{t:g}" for t in (c.get("targets") or [])[:3])
+                alerts.append(Alert(f"bc-{cid}-new", "bc_new", sym,
+                                    f"📣 <b>New broker call: {sym}</b> ({c.get('source', '')})\n"
+                                    f"Buy {c.get('entry_low')}–{c.get('entry_high')} · SL {c.get('stop')} · TP {tps}\n"
+                                    f"Sense check: {ev.get('verdict', '')}"
+                                    + (f" · size {ev['shares']:,} shares" if ev.get('shares') else "")
+                                    + (f"\n{c['claude_note']}" if c.get("claude_note") else "")))
+            if px is None or pd.isna(px):
+                continue
+            lo, hi = c.get("entry_low"), c.get("entry_high") or c.get("entry_low")
+            stop, tps = c.get("stop"), c.get("targets") or []
+            if c.get("or_below") and stop:
+                lo = stop * 1.001
+            if stop and px <= stop and f"bc-{cid}-stop" not in self.sent:
+                alerts.append(Alert(f"bc-{cid}-stop", "bc_stop", sym,
+                                    f"⚠️ <b>{sym}: broker's stop-loss {stop:g} hit</b> (now {px:,.2f})\n"
+                                    "If you hold it from this call, exit."))
+            elif tps and px >= tps[0] and f"bc-{cid}-tp1" not in self.sent:
+                alerts.append(Alert(f"bc-{cid}-tp1", "bc_tp", sym,
+                                    f"💰 <b>{sym} reached broker TP1 {tps[0]:g}</b> (now {px:,.2f})\n"
+                                    "Book partial profit and move the stop to entry."))
+            elif (lo and hi and lo * (0.99 if lo == hi else 0.995) <= px <= hi * (1.01 if lo == hi else 1.005)
+                  and f"bc-{cid}-zone" not in self.sent):
+                alerts.append(Alert(f"bc-{cid}-zone", "bc_zone", sym,
+                                    f"🎯 <b>{sym} is in the broker's buy zone</b> {lo:g}–{hi:g} (now {px:,.2f})\n"
+                                    "Check the sense check on the site before buying."))
+        return alerts
 
     # -- data
     def refresh_reference(self, force: bool = False) -> None:
@@ -322,9 +427,11 @@ class Engine:
                           self.session_fraction(now, cfg["open_t"], cfg["close_t"]),
                           settings, costs, cfg["kse_only"])
         prices = dict(zip(board["symbol"], board["current"]))
+        self.refresh_calls(cfg.get("calls_url", ""))
+        broker = self.broker_alerts(prices, costs, now)
         with self.lock:
             alerts = evaluate(scan, prices, self.positions, self.sent, now, cfg["close_t"], costs,
-                              cfg.get("buy_when_holding", False))
+                              cfg.get("buy_when_holding", False)) + broker
             if any(a.kind == "breakeven" for a in alerts):
                 self.save_positions()
         for a in alerts:
