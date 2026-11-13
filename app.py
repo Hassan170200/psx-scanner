@@ -108,8 +108,10 @@ with st.sidebar:
         close_t = st.time_input("Closes", dtime(15, 30))
         st.caption("Adjust for Fridays or Ramadan timings.")
     with st.expander("Broker costs & tax"):
-        comm = st.number_input("Commission rate (%)", 0.0, 2.5, 0.15, 0.01) / 100
-        comm_min = st.number_input("Min commission per share (Rs)", 0.0, 1.0, 0.03, 0.01)
+        st.caption("Defaults = KTrade standard plan: 0.25% for shares Rs 20+, Rs 0.05/share below. "
+                   "Premier-I plan: set 0.20%.")
+        comm = st.number_input("Commission rate (%)", 0.0, 2.5, 0.25, 0.01) / 100
+        comm_min = st.number_input("Min commission per share (Rs)", 0.0, 1.0, 0.05, 0.01)
         stax = st.number_input("Sales tax on commission (%)", 0.0, 20.0, 16.0, 1.0) / 100
         cgt = st.number_input("Capital gains tax (%)", 0.0, 30.0, 15.0, 1.0) / 100
 
@@ -176,15 +178,16 @@ def live() -> None:
             h1.markdown(f"### {r.symbol}  ·  {r.signal}")
             h2.markdown(f"**Rs {r.current:,.2f}**  ({r.change_pct:+.2f}% today) · "
                         f"volume {r.rvol:.1f}× normal")
-            m = st.columns(6)
+            m = st.columns(3)
             m[0].metric("Buy at", f"{r.entry:,.2f}")
             m[1].metric("Stop-loss", f"{r.stop:,.2f}")
             m[2].metric("Target", f"{r.target:,.2f}")
-            m[3].metric("Shares", f"{int(r.shares):,}", f"Rs {r.position_rs:,.0f}", delta_color="off",
+            n = st.columns(3)
+            n[0].metric("Shares", f"{int(r.shares):,}", f"Rs {r.position_rs:,.0f}", delta_color="off",
                         delta_arrow="off")
-            m[4].metric("Net at target", f"Rs {r.net_at_target:,.0f}", "after costs & tax", delta_color="off",
+            n[1].metric("Net at target (Rs)", f"{r.net_at_target:+,.0f}", "after costs & tax", delta_color="off",
                         delta_arrow="off")
-            m[5].metric("Loss at stop", f"Rs {r.loss_at_stop:,.0f}", f"{r.loss_at_stop / capital:.1%} of capital",
+            n[2].metric("Loss at stop (Rs)", f"{r.loss_at_stop:,.0f}", f"{r.loss_at_stop / capital:.1%} of capital",
                         delta_color="red", delta_arrow="off")
             if r.rr_after_costs is not None and r.rr_after_costs < 1.0:
                 st.caption("⚠️ After costs and tax, the profit at target is smaller than the loss at stop. Skip or widen the target.")
