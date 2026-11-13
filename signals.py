@@ -9,8 +9,8 @@ import pandas as pd
 
 @dataclass
 class Costs:
-    commission_rate: float = 0.0015      # 0.15% (PSX/SECP minimum)
-    min_comm_per_share: float = 0.03     # 3 paisa per share minimum
+    commission_rate: float = 0.0025      # KTrade standard: 0.25% (Rs 20+ shares)
+    min_comm_per_share: float = 0.05     # KTrade standard: Rs 0.05/share below Rs 20
     sales_tax: float = 0.16              # Punjab sales tax on commission
     exchange_fees: float = 0.000065      # PSX + NCCPL + SECP levies per side
     cdc_rate: float = 0.000036           # CDC per side
