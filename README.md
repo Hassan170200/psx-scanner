@@ -17,48 +17,45 @@ Live PSX prices, rule-based buy setups, and a full trade plan (shares, stop-loss
 
 On the free tier, the app goes to sleep after a few days without visitors. Open the link and click the wake-up button. It's back in about 30 seconds.
 
-## WhatsApp alerts (free, personal)
+## ntfy alerts (phone push notifications, free)
 
-Uses CallMeBot, a free gateway that can only message your own WhatsApp number.
-
-1. Save **+34 644 97 54 14** in your phone contacts (any name, e.g. "CallMeBot"). If that number doesn't reply, check callmebot.com for the current one.
-2. On WhatsApp, send it exactly: `I allow callmebot to send me messages`
-3. Within ~2 minutes it replies with your **APIKEY**. If not, try again after 24 hours.
-4. In Streamlit Cloud: **Manage app → ⋮ → Settings → Secrets**, add:
-   ```
-   WHATSAPP_PHONE = "+923001234567"
-   WHATSAPP_APIKEY = "123456"
-   ```
-   Use your own number with +92 and no leading 0. Save. The app restarts.
-5. In the app sidebar, click **Send test WhatsApp**.
-
-CallMeBot is a free shared service, so messages can take a few seconds and it has occasional outages. Keep Telegram set up too as a backup: when both are set up, every alert goes to both.
-
-## Telegram alerts (phone notifications)
-
-The app scans every minute in the background and messages you on Telegram:
+The app scans every minute in the background and sends a push notification to your phone:
 - 🟢 a new buy setup, with the buy price, stop, target and number of shares
-- 🔴 your stop-loss is hit (sell), ✅ your target is hit (sell)
+- 🔴 your stop-loss is hit (sell). Sent as **urgent**, so it rings loudly.
+- ✅ your target is hit (sell)
 - 🔵 you're up 1× your risk (move your stop to breakeven)
 - ⏰ 15 minutes before the close, while you still hold a position
 
-**One-time setup (about 5 minutes):**
-1. In Telegram, open **@BotFather**, send `/newbot`, and give it a name such as "PSX Hassan Alerts" and a username ending in `bot`. BotFather replies with a **token**.
-2. Open your new bot and send it any message, for example `hi`.
-3. In Streamlit Cloud, go to your app → **⋮ → Settings → Secrets** and paste:
+**One-time setup (about 2 minutes, no account needed):**
+1. Install the **ntfy** app from the Play Store or App Store.
+2. Open the app, tap **+** (Subscribe to topic) and enter the private channel name shown in the website's sidebar under **Phone alerts**, for example `psx-hassan-3f9a1c2b7d`. Leave the server as ntfy.sh. Keep this name private: anyone who knows it can read your alerts.
+3. In Streamlit Cloud: **Manage app → ⋮ → Settings → Secrets**, add:
    ```
-   TELEGRAM_TOKEN = "the-token-from-botfather"
+   NTFY_TOPIC = "psx-hassan-3f9a1c2b7d"
    ```
    Save. The app restarts.
-4. Open the app. In the sidebar under **Telegram alerts**, click **Find my chat ID** and copy the line it shows into Secrets below the token:
-   ```
-   TELEGRAM_CHAT_ID = "123456789"
-   ```
-5. Click **Send test alert** in the sidebar. You should get a message within seconds.
+4. In the sidebar, click **Send test push**. It should arrive within seconds.
 
 **Daily use:** open the site once each morning, before the market opens, to wake it up. After that you can close it and alerts keep coming. When you buy, press **I bought this** on the setup card (or add the position manually) so the app watches your stop and target. Press **I sold** after you exit.
 
 Your open position is stored on the server. If the app restarts (after an update or a long sleep), add your position again.
+
+## WhatsApp alerts (optional)
+
+Uses CallMeBot, a free gateway that can only message your own WhatsApp number. It can be slow to activate.
+
+1. Save **+34 644 97 54 14** in your phone contacts (any name, e.g. "CallMeBot"). If that number doesn't reply, check callmebot.com for the current one.
+2. On WhatsApp, send it exactly: `I allow callmebot to send me messages`
+3. Within ~2 minutes it replies with your **APIKEY**. If not, try again after 24 hours.
+4. In Secrets, add:
+   ```
+   WHATSAPP_PHONE = "+923001234567"
+   WHATSAPP_APIKEY = "123456"
+   ```
+   Use your own number with +92 and no leading 0.
+5. In the sidebar, click **Send test WhatsApp**.
+
+When ntfy and WhatsApp are both set up, every alert goes to both.
 
 ## If it says "Couldn't reach the PSX data portal"
 
