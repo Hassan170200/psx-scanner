@@ -17,6 +17,32 @@ Live PSX prices, rule-based buy setups, and a full trade plan (shares, stop-loss
 
 On the free tier, the app goes to sleep after a few days without visitors. Open the link and click the wake-up button. It's back in about 30 seconds.
 
+## Telegram alerts (phone notifications)
+
+The app scans every minute in the background and messages you on Telegram:
+- 🟢 a new buy setup, with the buy price, stop, target and number of shares
+- 🔴 your stop-loss is hit (sell), ✅ your target is hit (sell)
+- 🔵 you're up 1× your risk (move your stop to breakeven)
+- ⏰ 15 minutes before the close, while you still hold a position
+
+**One-time setup (about 5 minutes):**
+1. In Telegram, open **@BotFather**, send `/newbot`, and give it a name such as "PSX Hassan Alerts" and a username ending in `bot`. BotFather replies with a **token**.
+2. Open your new bot and send it any message, for example `hi`.
+3. In Streamlit Cloud, go to your app → **⋮ → Settings → Secrets** and paste:
+   ```
+   TELEGRAM_TOKEN = "the-token-from-botfather"
+   ```
+   Save. The app restarts.
+4. Open the app. In the sidebar under **Telegram alerts**, click **Find my chat ID** and copy the line it shows into Secrets below the token:
+   ```
+   TELEGRAM_CHAT_ID = "123456789"
+   ```
+5. Click **Send test alert** in the sidebar. You should get a message within seconds.
+
+**Daily use:** open the site once each morning, before the market opens, to wake it up. After that you can close it and alerts keep coming. When you buy, press **I bought this** on the setup card (or add the position manually) so the app watches your stop and target. Press **I sold** after you exit.
+
+Your open position is stored on the server. If the app restarts (after an update or a long sleep), add your position again.
+
 ## If it says "Couldn't reach the PSX data portal"
 
 Streamlit's servers are outside Pakistan, and PSX may block them. If the error keeps happening during market hours, run the same app on your laptop instead:
