@@ -17,6 +17,23 @@ Live PSX prices, rule-based buy setups, and a full trade plan (shares, stop-loss
 
 On the free tier, the app goes to sleep after a few days without visitors. Open the link and click the wake-up button. It's back in about 30 seconds.
 
+## WhatsApp alerts (free, personal)
+
+Uses CallMeBot, a free gateway that can only message your own WhatsApp number.
+
+1. Save **+34 644 97 54 14** in your phone contacts (any name, e.g. "CallMeBot"). If that number doesn't reply, check callmebot.com for the current one.
+2. On WhatsApp, send it exactly: `I allow callmebot to send me messages`
+3. Within ~2 minutes it replies with your **APIKEY**. If not, try again after 24 hours.
+4. In Streamlit Cloud: **Manage app → ⋮ → Settings → Secrets**, add:
+   ```
+   WHATSAPP_PHONE = "+923001234567"
+   WHATSAPP_APIKEY = "123456"
+   ```
+   Use your own number with +92 and no leading 0. Save. The app restarts.
+5. In the app sidebar, click **Send test WhatsApp**.
+
+CallMeBot is a free shared service, so messages can take a few seconds and it has occasional outages. Keep Telegram set up too as a backup: when both are set up, every alert goes to both.
+
 ## Telegram alerts (phone notifications)
 
 The app scans every minute in the background and messages you on Telegram:
