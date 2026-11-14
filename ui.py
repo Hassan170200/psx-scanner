@@ -255,3 +255,53 @@ def style_scan(show: pd.DataFrame):
                         for v in num["Signal"]]
     styles["Symbol"] = "color:#FFB020;font-weight:600"
     return disp.style.apply(lambda _: styles, axis=None)
+
+
+def paper_summary(s: dict, min_trades: int) -> None:
+    """Headline numbers for the paper-trading log, with an honest verdict."""
+    wr = f"{s['win_rate']:.0%}" if s["win_rate"] is not None else "–"
+    avg = signed(s["avg"]) if s["avg"] is not None else "–"
+    split = (f"wins avg {s['avg_win'] or 0:+,.0f} · losses avg {s['avg_loss'] or 0:+,.0f}"
+             if s["closed"] else "")
+    if s["closed"] < min_trades:
+        verdict = (f"{min_trades - s['closed']} more closed trades before these numbers mean much. "
+                   "Keep trading small or on paper until then.")
+        tone = "warn"
+    elif s["avg"] > 0:
+        verdict = (f"Positive so far: the signals made Rs {s['avg']:,.0f} per trade on average after costs and tax "
+                   f"over {s['closed']} trades.")
+        tone = "go"
+    else:
+        verdict = (f"Negative so far: the signals lost Rs {abs(s['avg']):,.0f} per trade on average after costs "
+                   f"over {s['closed']} trades. Don't trade them with real money yet.")
+        tone = "stop"
+    st.markdown(f"""
+<div class="tb-card {tone}">
+  {cells([("Trades", f"{s['closed']:,}", f"closed · {s['open']} open · {s['days']} days"),
+          ("Winners", wr, f"{s['wins']} made money after costs"),
+          ("Net result", signed(s["total"]), "Rs, after costs and tax"),
+          ("Avg per trade", avg, split),
+          ("Target / stop", f'<span class="up">{s["target"]}</span> / <span class="dn">{s["stop"]}</span>',
+           f"breakeven {s['breakeven']} · sold near close {s['time']}")])}
+  <div class="tb-note"><b>Verdict</b>{esc(verdict)}</div>
+</div>""", unsafe_allow_html=True)
+
+
+def style_paper(df: pd.DataFrame):
+    """Paper-trade table: prices as text, results coloured."""
+    disp = df.copy()
+    for col in ("Buy", "Stop", "Target", "High seen", "Low seen", "Sold at"):
+        disp[col] = df[col].map(lambda v: "–" if v is None or pd.isna(v) else f"{v:,.2f}")
+    disp["Shares"] = df["Shares"].map(lambda v: f"{int(v):,}")
+    disp["Net (Rs)"] = df["Net (Rs)"].map(lambda v: "–" if v is None or pd.isna(v) else f"{v:+,.0f}")
+    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+    for col in ("Buy", "Stop", "Target", "Shares", "High seen", "Low seen", "Sold at", "Net (Rs)"):
+        styles[col] = "text-align:right"
+    styles["Net (Rs)"] = ["text-align:right;color:#22C77A" if (v is not None and not pd.isna(v) and v > 0)
+                          else "text-align:right;color:#F0475B" if (v is not None and not pd.isna(v) and v < 0)
+                          else "text-align:right" for v in df["Net (Rs)"]]
+    res = {"Target": "color:#22C77A", "Stop": "color:#F0475B", "Breakeven": "color:#FFB020",
+           "Open": "color:#5CC8E8"}
+    styles["Result"] = [res.get(v, "") for v in df["Result"]]
+    styles["Symbol"] = "color:#FFB020;font-weight:600"
+    return disp.style.apply(lambda _: styles, axis=None)
