@@ -148,5 +148,9 @@ def build_scan(board: pd.DataFrame, avg_vol: dict, kse100: set, vwaps: dict,
                      if r.signal in ACTIONABLE else {})
     plan_df = pd.DataFrame(plans, index=df.index)
     df = pd.concat([df, plan_df], axis=1)
+    for col in ("entry", "stop", "target", "shares", "position_rs", "breakeven", "net_at_target",
+                "loss_at_stop", "rr_after_costs"):  # present even when nothing is actionable
+        if col not in df.columns:
+            df[col] = float("nan")
     df["actionable"] = df["signal"].isin(ACTIONABLE)
     return df.sort_values(["actionable", "score"], ascending=[False, False])
