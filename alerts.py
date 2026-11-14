@@ -20,6 +20,7 @@ import requests
 
 from broker_calls import RISK_BUDGET, evaluate as evaluate_call, load_calls
 from psx_client import PSXClient, PSXError
+from paper import PaperBook, day_summary
 from signals import ACTIONABLE, Costs, Settings, build_scan, session_vwap
 
 PKT = ZoneInfo("Asia/Karachi")
@@ -61,10 +62,11 @@ def send_whatsapp(phone: str, apikey: str, text: str) -> tuple[bool, str]:
 
 
 NTFY_PRIORITY = {"stop": 5, "target": 4, "breakeven": 4, "close_soon": 4, "buy": 4,
-                 "bc_new": 4, "bc_zone": 4, "bc_tp": 3, "bc_stop": 4}
+                 "bc_new": 4, "bc_zone": 4, "bc_tp": 3, "bc_stop": 4, "paper": 2}
 NTFY_TAGS = {"stop": ["rotating_light"], "target": ["moneybag"], "breakeven": ["shield"],
              "close_soon": ["alarm_clock"], "buy": ["chart_with_upwards_trend"],
-             "bc_new": ["loudspeaker"], "bc_zone": ["dart"], "bc_tp": ["moneybag"], "bc_stop": ["warning"]}
+             "bc_new": ["loudspeaker"], "bc_zone": ["dart"], "bc_tp": ["moneybag"], "bc_stop": ["warning"],
+             "paper": ["ledger"]}
 
 
 def send_ntfy(topic: str, text: str, kind: str = "test") -> tuple[bool, str]:
@@ -207,7 +209,7 @@ def evaluate(scan: pd.DataFrame, prices: dict, positions: list[Position], sent: 
 class Engine:
     """Shared state + background loop. One per server process."""
 
-    VERSION = 3  # bump when Engine changes, so a running app swaps in the new one
+    VERSION = 4  # bump when Engine changes, so a running app swaps in the new one
 
     def __init__(self, client: PSXClient | None = None, interval: int = 60) -> None:
         self.client = client or PSXClient()
@@ -235,6 +237,8 @@ class Engine:
         self.pasted: list[dict] = self._load_pasted()
         self.known_calls: set | None = None
         self.hist_cache: dict = {}
+        # paper-trading log
+        self.paper = PaperBook()
 
     # -- persistence (best effort; Streamlit Cloud wipes files on redeploy)
     def _load_positions(self) -> list[Position]:
@@ -431,6 +435,7 @@ class Engine:
         prices = dict(zip(board["symbol"], board["current"]))
         self.refresh_calls(cfg.get("calls_url", ""))
         broker = self.broker_alerts(prices, costs, now)
+        broker += self.paper_step(scan, prices, costs, now, cfg)
         with self.lock:
             alerts = evaluate(scan, prices, self.positions, self.sent, now, cfg["close_t"], costs,
                               cfg.get("buy_when_holding", False)) + broker
@@ -445,6 +450,23 @@ class Engine:
                 self.log = self.log[-50:]
         self.last_tick = now.strftime("%H:%M:%S")
         return alerts
+
+    def paper_step(self, scan, prices: dict, costs: Costs, now: datetime, cfg: dict) -> list[Alert]:
+        """Move the paper-trading log on; one summary push near the close."""
+        close_dt = now.replace(hour=cfg["close_t"].hour, minute=cfg["close_t"].minute, second=0, microsecond=0)
+        try:
+            self.paper.connect(cfg.get("gh_token", ""))
+            self.paper.update(scan, prices, now, costs,
+                              entry_cutoff=(close_dt - timedelta(minutes=30)).time(),
+                              exit_time=(close_dt - timedelta(minutes=15)).time())
+        except Exception:  # the log must never stop the alerts
+            log.exception("paper trades")
+            return []
+        if now >= close_dt - timedelta(minutes=10) and "paper-summary" not in self.sent:
+            text = day_summary(self.paper.snapshot(), now.date().isoformat())
+            if text:
+                return [Alert("paper-summary", "paper", "", text)]
+        return []
 
     def _run(self) -> None:
         while True:
