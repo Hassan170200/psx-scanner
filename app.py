@@ -12,9 +12,11 @@ import streamlit as st
 from alerts import Engine, Position, market_open, send_ntfy, send_whatsapp
 from broker_calls import evaluate as evaluate_call, parse_message, track_record
 from signals import Costs, Settings, build_scan
+import ui
 
 PKT = ZoneInfo("Asia/Karachi")
-st.set_page_config(page_title="PSX Live Scanner", page_icon="📈", layout="wide")
+st.set_page_config(page_title="PSX Terminal", page_icon="📈", layout="wide")
+ui.inject()
 
 
 @st.cache_resource
@@ -73,12 +75,12 @@ with st.sidebar:
         cgt = st.number_input("Capital gains tax (%)", 0.0, 30.0, 15.0, 1.0) / 100
 
     st.divider()
-    st.subheader("📣 Broker calls")
+    st.subheader("Broker calls")
     calls_url = secret("BROKER_CALLS_URL")
     risk_budget = st.number_input("Max loss per broker call (Rs)", 200, 20_000, 1_300, 100,
                                   help="Each broker call is sized so hitting its stop loses about this much.")
     st.divider()
-    st.subheader("📲 Phone alerts")
+    st.subheader("Phone alerts")
     ntfy_topic = secret("NTFY_TOPIC")
     wa_phone, wa_key = secret("WHATSAPP_PHONE"), secret("WHATSAPP_APIKEY")
     buy_when_holding = st.toggle("Buy alerts while I hold a position", value=False,
@@ -111,11 +113,6 @@ eng.config = {"settings": cfg, "costs": costs, "kse_only": kse_only, "open_t": o
               "close_t": close_t, "ntfy_topic": ntfy_topic, "calls_url": calls_url,
               "wa_phone": wa_phone, "wa_key": wa_key, "buy_when_holding": buy_when_holding}
 
-st.title("📈 PSX Live Scanner")
-st.caption("Live PSX prices → rule-based setups → full trade plan with costs and tax. "
-           "Signals are screens, not predictions. You decide every trade.")
-
-
 def get_board() -> pd.DataFrame | None:
     if eng.board is None or time.time() - eng.board_at > 150:
         eng.fetch_board()
@@ -125,67 +122,44 @@ def get_board() -> pd.DataFrame | None:
 
 
 def broker_section(prices: dict) -> None:
-    st.subheader("📣 Broker calls")
+    eng.refresh_calls(calls_url)
+    ui.panel("CALLS", "Broker calls", f"Calls file updated {eng.calls_updated or 'never'}")
     if not calls_url:
         st.info("Broker calls aren't connected yet. Add BROKER_CALLS_URL to the app's Secrets (see README).")
-    c1, c2 = st.columns([1, 3])
-    if c1.button("🔄 Update now", help="Reload the latest calls and recheck prices and history now."):
+    c1, c2 = st.columns([1, 4])
+    if c1.button("Update now", icon="🔄", help="Reload the latest calls and recheck prices and history now."):
         eng.refresh_calls(calls_url, force=True)
         for c in eng.all_calls():
             eng.history(c["symbol"], force=True)
         st.toast("Broker calls updated.")
-    else:
-        eng.refresh_calls(calls_url)
-    upd = eng.calls_updated or "never"
-    c2.caption(f"Calls file last updated by Claude: {upd}. Claude reads the WhatsApp channels hourly "
-               "on market days (9:40 am–3:40 pm). Use Update now to reload, or paste a call below.")
+    c2.caption("Claude reads the WhatsApp channels hourly on market days (9:40 am–3:40 pm). "
+               "Update now reloads them; you can also paste a call below.")
     if eng.calls_error:
         st.warning(f"Couldn't load the calls file: {eng.calls_error}")
-    with st.expander("➕ Paste a call from WhatsApp"):
-        txt = st.text_area("Paste the broker's message", height=140, key="paste_call")
+    with st.expander("Paste a call from WhatsApp"):
+        txt = st.text_area("Broker's message", height=140, key="paste_call")
         src = st.selectbox("Source", ["Nadeem Chawla-PSX", "KTrade", "Other"], key="paste_src")
         if st.button("Add call"):
             call = parse_message(txt, source=src)
             if call:
                 eng.add_pasted(call)
                 st.success(f"Added {call['symbol']}: buy {call['entry_low']}–{call['entry_high']}, "
-                           f"SL {call['stop']}, targets {call['targets']}")
+                           f"stop {call['stop']}, targets {call['targets']}")
             else:
                 st.error("Couldn't find a symbol with a stop-loss or target in that message.")
 
     calls = sorted(eng.all_calls(), key=lambda c: c.get("date", ""), reverse=True)[:15]
     if not calls:
-        st.caption("No calls yet. New calls from Monday 16 Nov will appear here.")
+        ui.empty("No calls yet. New calls from Monday 16 Nov will appear here.")
         return
     evals = []
     for c in calls:
         ev = evaluate_call(c, prices.get(c["symbol"]), eng.history(c["symbol"]), costs, risk_budget)
         evals.append(ev)
-        with st.container(border=True):
-            tps = " / ".join(f"{t:g}" for t in c.get("targets") or [])
-            h1, h2 = st.columns([3, 2])
-            h1.markdown(f"**{c['symbol']}** · {c.get('source', '')} · {c.get('date', '')} · "
-                        f"{c.get('timeframe') or ''}")
-            h2.markdown(f"**{ev.get('verdict', '')}**")
-            st.caption(f"Buy {c.get('entry_low')}–{c.get('entry_high')} · Stop {c.get('stop')} · Targets {tps}")
-            m = st.columns(4)
-            m[0].metric("Now", f"{ev['price']:,.2f}" if ev.get("price") else "–", ev.get("status"),
-                        delta_color="off", delta_arrow="off")
-            m[1].metric("Since call", ev.get("outcome", "–"))
-            if ev.get("shares"):
-                m[2].metric("Size for your risk", f"{ev['shares']:,} sh", f"Rs {ev['position_rs']:,.0f}",
-                            delta_color="off", delta_arrow="off")
-                last = ev.get("net_last")
-                m[3].metric("Win / loss (Rs)", f"{ev.get('net_tp1', 0):+,.0f}",
-                            f"final {last:+,.0f} · stop {ev['loss_at_stop']:,.0f}" if last is not None
-                            else f"stop {ev['loss_at_stop']:,.0f}", delta_color="off", delta_arrow="off")
-            for f in ev.get("flags", []):
-                st.caption(f"• {f}")
-            if c.get("claude_note"):
-                st.markdown(f"🧠 *{c['claude_note']}*")
-            if c in eng.pasted and st.button("Remove", key=f"rm-{c['id']}"):
-                eng.remove_pasted(c["id"])
-                st.rerun()
+        ui.call_card(c, ev)
+        if c in eng.pasted and st.button("Remove", key=f"rm-{c['id']}"):
+            eng.remove_pasted(c["id"])
+            st.rerun()
     tr = track_record(evals)
     if tr["closed"]:
         st.caption(f"Track record of these calls: {tr['closed']} finished: {tr['wins']} hit a target, "
@@ -199,6 +173,7 @@ def live() -> None:
     is_open = market_open(now, open_t, close_t)
     board = get_board()
     if board is None:
+        ui.status_bar(is_open, now.strftime("%I:%M:%S %p"), 0, 0, 0, 0, "unavailable")
         st.error(
             "Couldn't reach the PSX data portal from this server.\n\n"
             f"Details: {eng.board_error}\n\n"
@@ -220,45 +195,30 @@ def live() -> None:
             seen.add(a.key + a.at)
 
     moves = board["current"] - board["ldcp"] if "ldcp" in board.columns else board.get("change", pd.Series(dtype=float))
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Market", "OPEN" if is_open else "CLOSED")
-    c2.metric("Stocks up / down", f"{int((moves > 0).sum())} / {int((moves < 0).sum())}")
-    c3.metric("Setups right now", int(scan["actionable"].sum()) if not scan.empty else 0)
-    c4.metric("VWAP tracking", f"{len(vwaps)} stocks")
-    upd = datetime.fromtimestamp(eng.board_at, PKT).strftime("%a %d %b, %I:%M:%S %p")
-    st.caption(f"Prices as of {upd} PKT · source: dps.psx.com.pk{board.attrs.get('source', '')}")
+    upd = datetime.fromtimestamp(eng.board_at, PKT).strftime("%a %d %b, %I:%M %p")
+    ui.status_bar(is_open, now.strftime("%a %I:%M %p"), int((moves > 0).sum()), int((moves < 0).sum()),
+                  int(scan["actionable"].sum()) if not scan.empty else 0, len(vwaps), upd)
+    ui.ticker_tape(board)
     if not is_open:
-        st.info("Market looks closed, so these are the last available prices. "
-                "Setups and alerts work during trading hours.")
+        st.caption("Market is closed: these are the last available prices. Setups and alerts work during "
+                   "trading hours.")
 
-    # ---- my positions
-    st.subheader("My open position")
+    # ---- my position
+    ui.panel("POS", "My open position", "Watched for stop, target, breakeven and the close")
     if eng.positions:
         for p in list(eng.positions):
             px = prices.get(p.symbol)
-            with st.container(border=True):
-                if px is None or pd.isna(px):
-                    st.write(f"**{p.symbol}**: no live price right now.")
-                    continue
-                pl = (px - p.entry) * p.shares - costs.per_side(p.shares, p.entry) - costs.per_side(p.shares, px)
-                status = ("🔴 STOP HIT: SELL" if px <= p.stop else "✅ TARGET HIT: SELL" if px >= p.target
-                          else "🟡 Holding")
-                st.markdown(f"### {p.symbol} · {status}")
-                k = st.columns(5)
-                k[0].metric("Now", f"{px:,.2f}", f"{(px / p.entry - 1):+.2%}")
-                k[1].metric("Bought at", f"{p.entry:,.2f}", f"{p.shares:,} shares", delta_color="off",
-                            delta_arrow="off")
-                k[2].metric("Stop-loss", f"{p.stop:,.2f}", "breakeven" if p.breakeven_moved else None,
-                            delta_color="off", delta_arrow="off")
-                k[3].metric("Target", f"{p.target:,.2f}")
-                k[4].metric("P/L now (Rs)", f"{pl:+,.0f}", "after costs, before tax", delta_color="off",
-                            delta_arrow="off")
-                if st.button(f"I sold {p.symbol}", key=f"sold-{p.symbol}"):
-                    eng.close_position(p.symbol)
-                    st.rerun()
+            if px is None or pd.isna(px):
+                ui.empty(f"{p.symbol}: no live price right now.")
+                continue
+            pl = (px - p.entry) * p.shares - costs.per_side(p.shares, p.entry) - costs.per_side(p.shares, px)
+            ui.position_card(p, px, pl)
+            if st.button(f"I sold {p.symbol}", key=f"sold-{p.symbol}"):
+                eng.close_position(p.symbol)
+                st.rerun()
     else:
-        st.caption("None. When you buy, press **I bought this** on the setup (or add it below) "
-                   "so the app watches your stop and target and alerts you when to sell.")
+        ui.empty("No open position. When you buy, press I bought this on a setup (or add it below) "
+                 "so the app watches your stop and target and alerts you when to sell.")
     with st.expander("Add a position manually"):
         with st.form("add_pos", clear_on_submit=True):
             f1, f2, f3 = st.columns(3)
@@ -275,45 +235,28 @@ def live() -> None:
                                           opened=now.strftime("%Y-%m-%d %H:%M")))
                 st.rerun()
 
+    # ---- top setups
+    top = scan[scan["actionable"]].head(5) if not scan.empty else scan
+    ui.panel("SETUPS", "Top setups now", f"Sized for Rs {capital:,.0f} capital at {position_pct:.0%}")
+    if scan.empty:
+        ui.empty("No stocks pass your filters. Try lowering min volume or turning off KSE-100 only.")
+    elif top.empty:
+        ui.empty("No buy setups at the moment. Patience is a position.")
+    for r in top.itertuples():
+        ui.setup_card(r)
+        if st.button("I bought this", key=f"buy-{r.symbol}", icon="✅",
+                     help="Watch this trade: alerts at stop, target, breakeven and before the close."):
+            eng.add_position(Position(r.symbol, float(r.entry), int(r.shares), float(r.stop),
+                                      float(r.target), opened=now.strftime("%Y-%m-%d %H:%M")))
+            st.rerun()
+
     broker_section(prices)
 
     if scan.empty:
-        st.warning("No stocks pass your filters. Try lowering min volume or turning off KSE-100 only.")
         return
 
-    # ---- top setups
-    st.subheader("Top setups now")
-    top = scan[scan["actionable"]].head(5)
-    if top.empty:
-        st.write("No buy setups at the moment. Patience is a position.")
-    for r in top.itertuples():
-        with st.container(border=True):
-            h1, h2 = st.columns([3, 2])
-            h1.markdown(f"### {r.symbol}  ·  {r.signal}")
-            h2.markdown(f"**Rs {r.current:,.2f}**  ({r.change_pct:+.2f}% today) · "
-                        f"volume {r.rvol:.1f}× normal")
-            m = st.columns(3)
-            m[0].metric("Buy at", f"{r.entry:,.2f}")
-            m[1].metric("Stop-loss", f"{r.stop:,.2f}")
-            m[2].metric("Target", f"{r.target:,.2f}")
-            n = st.columns(3)
-            n[0].metric("Shares", f"{int(r.shares):,}", f"Rs {r.position_rs:,.0f}", delta_color="off",
-                        delta_arrow="off")
-            n[1].metric("Net at target (Rs)", f"{r.net_at_target:+,.0f}", "after costs & tax", delta_color="off",
-                        delta_arrow="off")
-            n[2].metric("Loss at stop (Rs)", f"{r.loss_at_stop:,.0f}", f"{r.loss_at_stop / capital:.1%} of capital",
-                        delta_color="red", delta_arrow="off")
-            if r.rr_after_costs is not None and r.rr_after_costs < 1.0:
-                st.caption("⚠️ After costs and tax, the profit at target is smaller than the loss at stop. "
-                           "Skip or widen the target.")
-            if st.button("✅ I bought this", key=f"buy-{r.symbol}",
-                         help="Watch this trade: alerts at stop, target, breakeven and before the close."):
-                eng.add_position(Position(r.symbol, float(r.entry), int(r.shares), float(r.stop),
-                                          float(r.target), opened=now.strftime("%Y-%m-%d %H:%M")))
-                st.rerun()
-
     # ---- full table
-    st.subheader("Scanner")
+    ui.panel("SCAN", "Scanner", f"{len(scan)} stocks pass your filters")
     show = scan[["symbol", "signal", "score", "current", "change_pct", "rvol", "volume",
                  "pos_in_range", "vwap", "entry", "stop", "target", "shares",
                  "net_at_target", "loss_at_stop"]].rename(columns={
@@ -322,25 +265,18 @@ def live() -> None:
         "pos_in_range": "Pos in day range", "vwap": "VWAP", "entry": "Buy", "stop": "Stop",
         "target": "Target", "shares": "Shares", "net_at_target": "Net @ target (Rs)",
         "loss_at_stop": "Loss @ stop (Rs)"})
-    st.dataframe(show, hide_index=True, width="stretch", height=min(420, 38 + 35 * len(show)),
-                 column_config={
-                     "Chg %": st.column_config.NumberColumn(format="%.2f"),
-                     "Vol vs normal": st.column_config.NumberColumn(format="%.1f×"),
-                     "Volume": st.column_config.NumberColumn(format="localized"),
-                     "Net @ target (Rs)": st.column_config.NumberColumn(format="localized"),
-                     "Loss @ stop (Rs)": st.column_config.NumberColumn(format="localized"),
-                     "Pos in day range": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.2f"),
-                     "VWAP": st.column_config.NumberColumn(format="%.2f"),
-                 })
+    st.dataframe(ui.style_scan(show), hide_index=True, width="stretch", height=min(440, 38 + 35 * len(show)),
+                 column_config={"Pos in day range": st.column_config.ProgressColumn(
+                     min_value=0, max_value=1, format="%.2f")})
 
     # ---- alerts log
     if eng.log:
-        st.subheader("Today's alerts")
+        ui.panel("LOG", "Today's alerts", f"{len(eng.log)} sent")
         for a in reversed(eng.log[-10:]):
-            st.markdown(f"**{a.at}** · " + a.text.replace("\n", "  \n"), unsafe_allow_html=True)
+            st.markdown(f"`{a.at}` " + a.text.replace("\n", "  \n"), unsafe_allow_html=True)
 
     # ---- chart for one stock
-    st.subheader("Intraday chart")
+    ui.panel("CHART", "Intraday chart", "Price and VWAP from today's snapshots")
     syms = scan["symbol"].tolist()
     held = [p.symbol for p in eng.positions if p.symbol in syms]
     sym = st.selectbox("Stock", syms, index=syms.index(held[0]) if held else 0, key="chart_sym")
@@ -352,10 +288,9 @@ def live() -> None:
         dv = ch["cumvol"].diff().clip(lower=0)
         mid = (ch["Price"] + ch["Price"].shift()) / 2
         ch["VWAP"] = (mid * dv).cumsum() / dv.cumsum()
-        st.line_chart(ch.set_index("t")[["Price", "VWAP"]])
+        st.line_chart(ch.set_index("t")[["Price", "VWAP"]], color=["#FFB020", "#5CC8E8"])
     else:
-        st.caption("Not enough snapshots yet for this stock. The chart fills in during market hours.")
-
+        ui.empty("Not enough snapshots yet for this stock. The chart fills in during market hours.")
 
 live()
 
