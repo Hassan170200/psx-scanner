@@ -70,6 +70,27 @@ Shows trade calls from your broker's WhatsApp channels with a sense check: live 
 - **Paste a call:** copy a broker message from WhatsApp and paste it to add it instantly.
 - Push alerts: a new call appears, the price enters the buy zone, TP1 is hit, or the stop is hit.
 
+## Paper trades (does the scanner actually make money?)
+
+From the first market day the app logs every buy setup as a paper trade: bought at the setup's price with the
+suggested share count, then sold at the target or stop (stop moved to breakeven at +1× risk), or 15 minutes
+before the close. Results are after KTrade costs and capital gains tax. The PAPER panel shows the win rate,
+average rupees per trade and a breakdown by signal type, and you can download it as CSV. A short summary is
+pushed to your phone 10 minutes before the close.
+
+Give it at least 20 closed trades before trusting the numbers. If the average per trade is negative after
+costs, don't trade the signals with real money yet.
+
+**Back it up (recommended, 2 minutes).** Streamlit Cloud wipes files when the app restarts, so connect a
+GitHub token and the log is saved to a private gist in your account:
+
+1. Open https://github.com/settings/tokens/new?scopes=gist&description=PSX%20scanner%20paper%20trades
+2. Set **Expiration** to 90 days (or longer), leave only **gist** ticked, and press **Generate token**.
+3. Copy the token (starts with `ghp_`). In Streamlit: **Manage app → ⋮ → Settings → Secrets**, add
+   `GITHUB_TOKEN = "ghp_..."` on a new line and press **Save**.
+
+The panel's footnote changes to "Backed up to a private gist" once it's connected.
+
 ## If it says "Couldn't reach the PSX data portal"
 
 Streamlit's servers are outside Pakistan, and PSX may block them. If the error keeps happening during market hours, run the same app on your laptop instead:
