@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
+from paper import MIN_TRADES, by_signal, stats as paper_stats, to_frame as paper_frame
 from alerts import Engine, Position, market_open, send_ntfy, send_whatsapp
 from broker_calls import evaluate as evaluate_call, parse_message, track_record
 from signals import Costs, Settings, build_scan
@@ -77,6 +78,7 @@ with st.sidebar:
     st.divider()
     st.subheader("Broker calls")
     calls_url = secret("BROKER_CALLS_URL")
+    gh_token = secret("GITHUB_TOKEN")
     risk_budget = st.number_input("Max loss per broker call (Rs)", 200, 20_000, 1_300, 100,
                                   help="Each broker call is sized so hitting its stop loses about this much.")
     st.divider()
@@ -111,7 +113,8 @@ costs = Costs(commission_rate=comm, min_comm_per_share=comm_min, sales_tax=stax,
 # The latest settings drive the background alerts
 eng.config = {"settings": cfg, "costs": costs, "kse_only": kse_only, "open_t": open_t,
               "close_t": close_t, "ntfy_topic": ntfy_topic, "calls_url": calls_url,
-              "wa_phone": wa_phone, "wa_key": wa_key, "buy_when_holding": buy_when_holding}
+              "wa_phone": wa_phone, "wa_key": wa_key, "buy_when_holding": buy_when_holding,
+              "gh_token": gh_token}
 
 def get_board() -> pd.DataFrame | None:
     if eng.board is None or time.time() - eng.board_at > 150:
@@ -294,6 +297,37 @@ def live() -> None:
 
 live()
 
+
+def paper_section() -> None:
+    eng.paper.connect(gh_token)
+    trades = eng.paper.snapshot()
+    meta = f"Every buy setup since {trades[0].date}" if trades else "Every buy setup, followed by your plan's rules"
+    ui.panel("PAPER", "Paper trades", meta)
+    if not trades:
+        ui.empty("Recording starts at the next market open. Every buy setup is logged at its buy price with the "
+                 "suggested share count, then sold at the target or stop, with the stop moved to breakeven at "
+                 "+1× risk, and sold 15 minutes before the close if neither is hit.")
+    else:
+        ui.paper_summary(paper_stats(trades), MIN_TRADES)
+        df = paper_frame(trades).iloc[::-1].reset_index(drop=True)
+        st.dataframe(ui.style_paper(df), hide_index=True, width="stretch", height=min(420, 38 + 35 * len(df)))
+        c1, c2 = st.columns([1, 3])
+        c1.download_button("Download CSV", df.to_csv(index=False), "paper_trades.csv", "text/csv",
+                           icon="⬇️")
+        with c2.expander("Results by signal type"):
+            st.dataframe(by_signal(trades), hide_index=True, width="stretch")
+    if eng.paper.gist_id:
+        st.caption("Backed up to a private gist in your GitHub account, so restarts don't lose it. "
+                   "A summary is pushed to your phone 10 minutes before the close.")
+    elif eng.paper.remote_error:
+        st.caption(f"{eng.paper.remote_error}. The log is kept on the app server meanwhile, and a restart wipes it.")
+    else:
+        st.caption("Kept on the app server only, so a restart wipes it. Add GITHUB_TOKEN to Secrets to back it up "
+                   "(see README → Paper trades). A summary is pushed to your phone 10 minutes before the close.")
+
+
+paper_section()
+
 with st.expander("How the signals and alerts work"):
     st.markdown(
         f"""
@@ -309,6 +343,9 @@ with st.expander("How the signals and alerts work"):
 - **Alerts** (ntfy push and/or WhatsApp, checked every minute in market hours): new buy setups (max 3 per scan, once per stock
   per day, paused while you hold a position unless you switch that on); for your position: stop hit → sell,
   target hit → sell, up 1× risk → move stop to breakeven, and 15 minutes before the close.
+- **Paper trades**: every buy setup (once per stock per day, until 30 min before the close) is logged at its buy
+  price and followed with the same rules: target, stop, breakeven at +1× risk, sold 15 min before the close.
+  Net results include costs and tax. Use it to see whether the signals make money before trading them.
 - The background scanner runs while the app is awake. Open the site once each morning to wake it.
 """
     )
