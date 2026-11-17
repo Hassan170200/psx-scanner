@@ -53,6 +53,9 @@ with st.sidebar:
     position_pct = st.slider("Position size (% of capital)", 10, 100, 100, 10) / 100
     stop_pct = st.slider("Max stop-loss distance (%)", 0.5, 5.0, 2.0, 0.25) / 100
     rr = st.slider("Target = risk x", 1.0, 4.0, 2.0, 0.25)
+    min_rr = st.slider("Min profit vs loss after costs", 0.5, 1.5, 1.0, 0.05,
+                       help="Skip setups where the profit at target (after costs and tax) is less than "
+                            "this many times the loss at stop. 1.0 means a win must at least cover a loss.")
     st.divider()
     st.subheader("Filters")
     kse_only = st.toggle("KSE-100 stocks only", value=True)
@@ -107,7 +110,7 @@ with st.sidebar:
     st.caption(f"Background scanner: {'running' if eng.running else 'stopped'}"
                + (f" · last scan {eng.last_tick}" if eng.last_tick else ""))
 
-cfg = Settings(capital=capital, position_pct=position_pct, stop_pct=stop_pct, reward_risk=rr,
+cfg = Settings(capital=capital, position_pct=position_pct, stop_pct=stop_pct, reward_risk=rr, min_rr=min_rr,
                min_price=min_price, min_volume=min_volume, lot_size=int(lot))
 costs = Costs(commission_rate=comm, min_comm_per_share=comm_min, sales_tax=stax, cgt=cgt)
 # The latest settings drive the background alerts
@@ -336,8 +339,11 @@ with st.expander("How the signals and alerts work"):
 - **VWAP bounce**: green on the day, volume at or above normal pace, price within 0.6% above VWAP.
 - **Volume building**: volume 2× normal but price flat. Watch it; don't buy yet.
 - **Overextended** (up 7%+) and **Falling** (down 3%+) are flagged so you avoid chasing or catching knives.
-- **Stop-loss**: the tightest of VWAP, today's low, or {stop_pct:.1%} below entry, keeping at least 0.5% room.
-  **Target**: {rr}× the risk.
+- **Stop-loss**: the tightest of VWAP, today's low, or {stop_pct:.1%} below entry, keeping at least 0.5% room,
+  and wide enough that the profit at target is at least {min_rr:.2f}× the loss at stop after costs.
+  If no stop within {stop_pct:.1%} manages that, the setup shows as **Costs too high - skip**. **Target**: {rr}× the risk.
+- **VWAP** counts only after the app has watched a stock for 45 minutes. Before that (early morning, or after the
+  app wakes up mid-day) there are no VWAP bounce signals, because a fresh VWAP sits right on the price.
 - **Costs**: commission max(Rs {comm_min:.2f}/share, {comm:.2%}) + {stax:.0%} sales tax, exchange/CDC fees,
   and {cgt:.0%} capital gains tax on profit.
 - **Alerts** (ntfy push and/or WhatsApp, checked every minute in market hours): new buy setups (max 3 per scan, once per stock
