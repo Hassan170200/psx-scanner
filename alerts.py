@@ -21,7 +21,7 @@ import requests
 from broker_calls import RISK_BUDGET, evaluate as evaluate_call, load_calls
 from psx_client import PSXClient, PSXError
 from paper import PaperBook, day_summary
-from signals import ACTIONABLE, Costs, Settings, build_scan, session_vwap
+from signals import ACTIONABLE, VWAP_WARMUP_MIN, Costs, Settings, build_scan, session_vwap
 
 PKT = ZoneInfo("Asia/Karachi")
 log = logging.getLogger("psx-alerts")
@@ -209,7 +209,7 @@ def evaluate(scan: pd.DataFrame, prices: dict, positions: list[Position], sent: 
 class Engine:
     """Shared state + background loop. One per server process."""
 
-    VERSION = 4  # bump when Engine changes, so a running app swaps in the new one
+    VERSION = 5  # bump when Engine changes, so a running app swaps in the new one
 
     def __init__(self, client: PSXClient | None = None, interval: int = 60) -> None:
         self.client = client or PSXClient()
@@ -397,9 +397,13 @@ class Engine:
                 if not s or vol != s[-1][2]:
                     s.append((now_ts, float(px), float(vol)))
 
-    def vwaps(self) -> dict:
+    def vwaps(self, warmup_min: int = VWAP_WARMUP_MIN) -> dict:
+        """VWAP per stock, only once the app has watched it long enough to be meaningful.
+        (After a restart or wake-up mid-session, VWAP starts from scratch and sits right on
+        the price, which makes everything look like a VWAP bounce.)"""
         with self.lock:
-            return {s: v for s, sn in self.snaps.items() if (v := session_vwap(sn))}
+            return {s: v for s, sn in self.snaps.items()
+                    if sn and sn[-1][0] - sn[0][0] >= warmup_min * 60 and (v := session_vwap(sn))}
 
     def session_fraction(self, now: datetime, open_t: dtime, close_t: dtime) -> float:
         if not market_open(now, open_t, close_t):
