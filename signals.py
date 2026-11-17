@@ -34,9 +34,12 @@ class Settings:
     min_price: float = 20.0
     min_volume: float = 200_000
     lot_size: int = 1
+    min_rr: float = 1.0            # skip setups whose profit at target < this x the loss at stop, after costs
 
 
 ACTIONABLE = ("Momentum breakout", "VWAP bounce")
+COSTLY = "Costs too high - skip"
+VWAP_WARMUP_MIN = 45  # minutes of snapshots before a stock's VWAP is trusted
 
 
 def session_vwap(snaps: list[tuple[float, float, float]]) -> float | None:
@@ -87,8 +90,17 @@ def plan_trade(entry: float, low, vwap, cfg: Settings, costs: Costs) -> dict:
         candidates.append(vwap * 0.997)
     if low and not pd.isna(low) and low < entry:
         candidates.append(low * 0.998)
-    # tightest structural stop that still leaves at least 0.5% room
-    stop = max(c for c in candidates if c <= entry * 0.995) if any(c <= entry * 0.995 for c in candidates) else floor_stop
+    # tightest structural stop (at least 0.5% room, no wider than the max stop) whose
+    # profit at target still beats the loss at stop after costs; else the widest allowed
+    stops = sorted({c for c in candidates if floor_stop <= c <= entry * 0.995}, reverse=True) or [floor_stop]
+    plans = [_plan(entry, s, cfg, costs) for s in stops]
+    for p in plans:
+        if p["rr_after_costs"] is not None and p["rr_after_costs"] >= cfg.min_rr:
+            return p
+    return plans[-1]
+
+
+def _plan(entry: float, stop: float, cfg: Settings, costs: Costs) -> dict:
     target = entry + cfg.reward_risk * (entry - stop)
     budget = cfg.capital * cfg.position_pct
     shares = math.floor(budget / entry / cfg.lot_size) * cfg.lot_size if entry > 0 else 0
@@ -141,11 +153,18 @@ def build_scan(board: pd.DataFrame, avg_vol: dict, kse100: set, vwaps: dict,
         for r in df.itertuples()
     ]
     df["score"] = df.apply(score, axis=1)
-    plans = []
+    plans, sigs = [], []
     for r in df.itertuples():
         entry = r.offer_price if pd.notna(r.offer_price) and r.offer_price > 0 else r.current
-        plans.append(plan_trade(entry, r.low, r.vwap if pd.notna(r.vwap) else None, cfg, costs)
-                     if r.signal in ACTIONABLE else {})
+        p = (plan_trade(entry, r.low, r.vwap if pd.notna(r.vwap) else None, cfg, costs)
+             if r.signal in ACTIONABLE else {})
+        if p and (p["rr_after_costs"] is None or p["rr_after_costs"] < cfg.min_rr):
+            p, sig = {}, COSTLY  # a win wouldn't cover a loss after costs
+        else:
+            sig = r.signal
+        plans.append(p)
+        sigs.append(sig)
+    df["signal"] = sigs
     plan_df = pd.DataFrame(plans, index=df.index)
     df = pd.concat([df, plan_df], axis=1)
     for col in ("entry", "stop", "target", "shares", "position_rs", "breakeven", "net_at_target",
