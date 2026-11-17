@@ -123,7 +123,7 @@ def status_bar(is_open: bool, clock: str, up: int, down: int, setups: int, vwap_
   <div class="tb-cell"><label>Karachi time</label><b>{esc(clock)}</b></div>
   <div class="tb-cell"><label>Advancing / declining</label><b><span class="up">{up}</span> / <span class="dn">{down}</span></b></div>
   <div class="tb-cell"><label>Buy setups</label><b>{setups}</b></div>
-  <div class="tb-cell"><label>VWAP tracked</label><b>{vwap_n}</b></div>
+  <div class="tb-cell"><label>VWAP ready</label><b>{vwap_n}</b></div>
   <div class="tb-cell grow"><label>Prices from PSX data portal</label><b>{esc(data_time)}</b></div>
 </div>""", unsafe_allow_html=True)
 
