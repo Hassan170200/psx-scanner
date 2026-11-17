@@ -205,11 +205,29 @@ def evaluate(scan: pd.DataFrame, prices: dict, positions: list[Position], sent: 
     return alerts
 
 
+def market_mood(board: pd.DataFrame, kse100: set) -> dict:
+    """Market conditions for the journal: average % change of KSE-100 stocks, and the share of
+    all stocks that are up."""
+    out: dict = {}
+    if board is None or board.empty or not {"current", "ldcp"} <= set(board.columns):
+        return out
+    chg = (board["current"] - board["ldcp"]) / board["ldcp"] * 100
+    chg = chg.replace([float("inf"), float("-inf")], float("nan"))
+    idx = chg[board["symbol"].isin(kse100)].dropna() if kse100 else chg.dropna()
+    if not idx.empty:
+        out["mkt_chg"] = float(idx.clip(-10, 10).mean())
+    moved = chg.dropna()
+    moved = moved[moved != 0]
+    if not moved.empty:
+        out["breadth"] = float((moved > 0).mean())
+    return out
+
+
 # ---------------------------------------------------------------- engine
 class Engine:
     """Shared state + background loop. One per server process."""
 
-    VERSION = 5  # bump when Engine changes, so a running app swaps in the new one
+    VERSION = 6  # bump when Engine changes, so a running app swaps in the new one
 
     def __init__(self, client: PSXClient | None = None, interval: int = 60) -> None:
         self.client = client or PSXClient()
@@ -439,7 +457,7 @@ class Engine:
         prices = dict(zip(board["symbol"], board["current"]))
         self.refresh_calls(cfg.get("calls_url", ""))
         broker = self.broker_alerts(prices, costs, now)
-        broker += self.paper_step(scan, prices, costs, now, cfg)
+        broker += self.paper_step(scan, prices, costs, now, cfg, market_mood(board, self.kse100))
         with self.lock:
             alerts = evaluate(scan, prices, self.positions, self.sent, now, cfg["close_t"], costs,
                               cfg.get("buy_when_holding", False)) + broker
@@ -455,14 +473,15 @@ class Engine:
         self.last_tick = now.strftime("%H:%M:%S")
         return alerts
 
-    def paper_step(self, scan, prices: dict, costs: Costs, now: datetime, cfg: dict) -> list[Alert]:
+    def paper_step(self, scan, prices: dict, costs: Costs, now: datetime, cfg: dict,
+                   market: dict | None = None) -> list[Alert]:
         """Move the paper-trading log on; one summary push near the close."""
         close_dt = now.replace(hour=cfg["close_t"].hour, minute=cfg["close_t"].minute, second=0, microsecond=0)
         try:
             self.paper.connect(cfg.get("gh_token", ""))
             self.paper.update(scan, prices, now, costs,
                               entry_cutoff=(close_dt - timedelta(minutes=30)).time(),
-                              exit_time=(close_dt - timedelta(minutes=15)).time())
+                              exit_time=(close_dt - timedelta(minutes=15)).time(), market=market)
         except Exception:  # the log must never stop the alerts
             log.exception("paper trades")
             return []

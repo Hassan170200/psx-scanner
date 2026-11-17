@@ -37,6 +37,10 @@ class Settings:
     min_rr: float = 1.0            # skip setups whose profit at target < this x the loss at stop, after costs
 
 
+# Bump when the buy/stop/target rules change, so the journal can compare rule sets fairly.
+# 1 = up to 17 Nov 13:30 (tight stops, no VWAP warm-up); 2 = stops must pay for themselves + VWAP warm-up.
+RULES_VERSION = 2
+
 ACTIONABLE = ("Momentum breakout", "VWAP bounce")
 COSTLY = "Costs too high - skip"
 VWAP_WARMUP_MIN = 45  # minutes of snapshots before a stock's VWAP is trusted
@@ -159,7 +163,8 @@ def build_scan(board: pd.DataFrame, avg_vol: dict, kse100: set, vwaps: dict,
         p = (plan_trade(entry, r.low, r.vwap if pd.notna(r.vwap) else None, cfg, costs)
              if r.signal in ACTIONABLE else {})
         if p and (p["rr_after_costs"] is None or p["rr_after_costs"] < cfg.min_rr):
-            p, sig = {}, COSTLY  # a win wouldn't cover a loss after costs
+            sig = COSTLY  # a win wouldn't cover a loss after costs: not alerted, but the journal
+                          # follows it as a skipped setup to check the skip rule is right
         else:
             sig = r.signal
         plans.append(p)

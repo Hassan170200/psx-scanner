@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from paper import MIN_TRADES, by_signal, stats as paper_stats, to_frame as paper_frame
+from paper import GROUPS, MIN_TRADES, breakdown, journal_frame, stats as paper_stats, taken, to_frame as paper_frame
 from alerts import Engine, Position, market_open, send_ntfy, send_whatsapp
 from broker_calls import evaluate as evaluate_call, parse_message, track_record
 from signals import Costs, Settings, build_scan
@@ -303,7 +303,9 @@ live()
 
 def paper_section() -> None:
     eng.paper.connect(gh_token)
-    trades = eng.paper.snapshot()
+    everything = eng.paper.snapshot()
+    trades = taken(everything)
+    skipped = [t for t in everything if not t.taken]
     meta = f"Every buy setup since {trades[0].date}" if trades else "Every buy setup, followed by your plan's rules"
     ui.panel("PAPER", "Paper trades", meta)
     if not trades:
@@ -315,18 +317,40 @@ def paper_section() -> None:
         df = paper_frame(trades).iloc[::-1].reset_index(drop=True)
         st.dataframe(ui.style_paper(df), hide_index=True, width="stretch", height=min(420, 38 + 35 * len(df)))
         c1, c2 = st.columns([1, 3])
-        c1.download_button("Download CSV", df.to_csv(index=False), "paper_trades.csv", "text/csv",
-                           icon="⬇️")
-        with c2.expander("Results by signal type"):
-            st.dataframe(by_signal(trades), hide_index=True, width="stretch")
+        c1.download_button("Download journal (CSV)", journal_frame(everything).to_csv(index=False),
+                           f"psx_paper_journal_{datetime.now(PKT):%Y-%m-%d}.csv", "text/csv", icon="⬇️",
+                           help="Every trade with its entry conditions and how far it moved: taken and skipped.")
+
+    if everything:
+        ui.panel("JOURNAL", "What's working", "Results grouped by the conditions at entry, after costs and tax")
+        by = st.segmented_control("Group by", list(GROUPS), default="Signal", key="journal_by") or "Signal"
+        pool = everything if by == "Taken or skipped" else trades
+        if pool:
+            st.dataframe(breakdown(pool, by), hide_index=True, width="stretch")
+        st.caption("**Avg best move** = how far the price went above the buy price before the trade closed. "
+                   "If it is well below the target %, the signal has no follow-through. "
+                   "**Reached +1× risk** = trades that got far enough to move the stop to breakeven. "
+                   "Market mood and volume are recorded from 18 Nov onward. Give each group 10+ trades "
+                   "before drawing conclusions.")
+        if skipped:
+            with st.expander(f"Skipped setups followed anyway ({len(skipped)}) — was skipping them right?"):
+                s = paper_stats(skipped)
+                st.markdown(f"{s['closed']} closed · {s['win_rate'] or 0:.0%} winners · net Rs {s['total']:+,.0f} · "
+                            f"avg Rs {s['avg'] or 0:+,.0f} per trade. If this stays negative, the skip rule is "
+                            "saving you money.")
+                sdf = paper_frame(skipped).iloc[::-1].reset_index(drop=True)
+                st.dataframe(ui.style_paper(sdf), hide_index=True, width="stretch",
+                             height=min(320, 38 + 35 * len(sdf)))
+
     if eng.paper.gist_id:
         st.caption("Backed up to a private gist in your GitHub account, so restarts don't lose it. "
                    "A summary is pushed to your phone 10 minutes before the close.")
     elif eng.paper.remote_error:
         st.caption(f"{eng.paper.remote_error}. The log is kept on the app server meanwhile, and a restart wipes it.")
     else:
-        st.caption("Kept on the app server only, so a restart wipes it. Add GITHUB_TOKEN to Secrets to back it up "
-                   "(see README → Paper trades). A summary is pushed to your phone 10 minutes before the close.")
+        st.caption("⚠️ Kept on the app server only, so a restart or update wipes new trades. Add GITHUB_TOKEN to "
+                   "Secrets to keep the journal permanently (see README → Paper trades). A summary is pushed to "
+                   "your phone 10 minutes before the close.")
 
 
 paper_section()
@@ -352,6 +376,10 @@ with st.expander("How the signals and alerts work"):
 - **Paper trades**: every buy setup (once per stock per day, until 30 min before the close) is logged at its buy
   price and followed with the same rules: target, stop, breakeven at +1× risk, sold 15 min before the close.
   Net results include costs and tax. Use it to see whether the signals make money before trading them.
+- **Journal**: each paper trade also records the time, the stock's move and volume, distance from VWAP, stop width
+  and the market's mood when it was opened, plus the best and worst price it reached. Setups skipped as
+  "Costs too high" are followed the same way, separately. Group the results in **What's working** or download
+  the CSV to find which conditions make money and turn them into new rules.
 - The background scanner runs while the app is awake. Open the site once each morning to wake it.
 """
     )

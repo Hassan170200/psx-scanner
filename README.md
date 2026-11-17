@@ -78,6 +78,14 @@ before the close. Results are after KTrade costs and capital gains tax. The PAPE
 average rupees per trade and a breakdown by signal type, and you can download it as CSV. A short summary is
 pushed to your phone 10 minutes before the close.
 
+**Journal (from 18 Nov).** Each paper trade also records what things looked like when it was opened: time,
+the stock's move and volume vs normal, distance from VWAP, stop width, the rules version, and the market's mood
+(average move of KSE-100 stocks and the share of stocks up). It also records the best and worst price reached
+and when. Setups skipped as "Costs too high" are followed the same way, kept separate. The **What's working**
+panel groups results by signal, entry time, market mood, volume, stop width and rules version; **Download
+journal (CSV)** gives every field for deeper study. After a week or two, use it to write new rules (for example
+"only momentum breakouts before 11:00 on up days"). The 11 trades from 17 Nov are kept in `paper_seed.json`.
+
 Give it at least 20 closed trades before trusting the numbers. If the average per trade is negative after
 costs, don't trade the signals with real money yet.
 
