@@ -10,9 +10,10 @@ import pandas as pd
 import streamlit as st
 
 from paper import GROUPS, MIN_TRADES, breakdown, journal_frame, stats as paper_stats, taken, to_frame as paper_frame
-from alerts import Engine, Position, market_open, send_ntfy, send_whatsapp
+from alerts import Engine, Position, market_open, position_pl, send_ntfy, send_whatsapp
 from broker_calls import evaluate as evaluate_call, parse_message, track_record
 from signals import Costs, Settings, build_scan
+import swing
 import ui
 
 PKT = ZoneInfo("Asia/Karachi")
@@ -48,14 +49,29 @@ if getattr(eng, "VERSION", 0) != Engine.VERSION:  # code updated while the app w
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
-    st.header("Your settings")
-    capital = st.number_input("Capital (Rs)", 1_000, 100_000_000, 50_000, 5_000)
-    position_pct = st.slider("Position size (% of capital)", 10, 100, 100, 10) / 100
-    stop_pct = st.slider("Max stop-loss distance (%)", 0.5, 5.0, 2.0, 0.25) / 100
-    rr = st.slider("Target = risk x", 1.0, 4.0, 2.0, 0.25)
-    min_rr = st.slider("Min profit vs loss after costs", 0.5, 1.5, 1.0, 0.05,
-                       help="Skip setups where the profit at target (after costs and tax) is less than "
-                            "this many times the loss at stop. 1.0 means a win must at least cover a loss.")
+    st.header("Your money")
+    total_capital = st.number_input("Total capital (Rs)", 1_000, 100_000_000, 50_000, 5_000)
+    core_pct = st.slider("Core: hold the market (%)", 0, 100, 80, 5,
+                         help="Backtest 2022–2026: simply holding the KSE-100 beat every trading rule tested. "
+                              "The core is bought and held; only the rest (satellite) is traded.")
+    core_amt = total_capital * core_pct / 100
+    capital = total_capital - core_amt
+    st.caption(f"Core **Rs {core_amt:,.0f}** held · Satellite **Rs {capital:,.0f}** for trades")
+    position_pct = st.slider("Satellite used per trade (%)", 10, 100, 100, 10) / 100
+    st.divider()
+    st.subheader("Swing rules (satellite)")
+    sw_top = st.select_slider("Only the strongest stocks (by 3-month return)", options=[5, 10, 20, 30], value=20)
+    sw_hold = st.slider("Sell after (trading days)", 2, 15, 4)
+    sw_rr = st.slider("Swing target = risk x", 1.5, 4.0, 2.0, 0.5)
+    sw_max_stop = st.slider("Max swing stop (%)", 2.0, 8.0, 5.0, 0.5) / 100
+    with st.expander("Intraday rules (paper only)"):
+        stop_pct = st.slider("Max stop-loss distance (%)", 0.5, 5.0, 2.0, 0.25) / 100
+        rr = st.slider("Target = risk x", 1.0, 4.0, 2.0, 0.25)
+        min_rr = st.slider("Min profit vs loss after costs", 0.5, 1.5, 1.0, 0.05,
+                           help="Skip setups where the profit at target (after costs and tax) is less than "
+                                "this many times the loss at stop. 1.0 means a win must at least cover a loss.")
+        mom_window = st.slider("Momentum entries only in the first (minutes)", 15, 330, 45, 15,
+                               help="Paper trades 17–23 Nov: momentum bought after 10:15 lost money.")
     st.divider()
     st.subheader("Filters")
     kse_only = st.toggle("KSE-100 stocks only", value=True)
@@ -88,6 +104,10 @@ with st.sidebar:
     st.subheader("Phone alerts")
     ntfy_topic = secret("NTFY_TOPIC")
     wa_phone, wa_key = secret("WHATSAPP_PHONE"), secret("WHATSAPP_APIKEY")
+    swing_alerts = st.toggle("Swing buy alerts (3:00–3:27 pm)", value=True)
+    intraday_alerts = st.toggle("Intraday buy alerts", value=False,
+                                help="Off by default: intraday signals lost money on paper (17–23 Nov). "
+                                     "They're still paper-traded so you can watch them improve.")
     buy_when_holding = st.toggle("Buy alerts while I hold a position", value=False,
                                  help="Off = one position at a time: no new buy alerts until you sell.")
     st.markdown("**ntfy push** (main)")
@@ -111,13 +131,17 @@ with st.sidebar:
                + (f" · last scan {eng.last_tick}" if eng.last_tick else ""))
 
 cfg = Settings(capital=capital, position_pct=position_pct, stop_pct=stop_pct, reward_risk=rr, min_rr=min_rr,
-               min_price=min_price, min_volume=min_volume, lot_size=int(lot))
+               min_price=min_price, min_volume=min_volume, lot_size=int(lot), momentum_window_min=mom_window)
 costs = Costs(commission_rate=comm, min_comm_per_share=comm_min, sales_tax=stax, cgt=cgt)
+sw_cfg = swing.SwingSettings(capital=capital * position_pct, top_n=sw_top, hold_days=sw_hold, reward_risk=sw_rr,
+                             max_stop=sw_max_stop)
 # The latest settings drive the background alerts
 eng.config = {"settings": cfg, "costs": costs, "kse_only": kse_only, "open_t": open_t,
               "close_t": close_t, "ntfy_topic": ntfy_topic, "calls_url": calls_url,
               "wa_phone": wa_phone, "wa_key": wa_key, "buy_when_holding": buy_when_holding,
-              "gh_token": gh_token}
+              "gh_token": gh_token, "swing": sw_cfg, "swing_alerts": swing_alerts,
+              "intraday_alerts": intraday_alerts}
+eng.ensure_history()
 
 def get_board() -> pd.DataFrame | None:
     if eng.board is None or time.time() - eng.board_at > 150:
@@ -172,6 +196,154 @@ def broker_section(prices: dict) -> None:
                    f"{tr['partial']} hit a target then stopped, {tr['losses']} stopped out.")
 
 
+# ---------------------------------------------------------------- strategy sections
+ETFS = ["UBLPETF", "NITGETF", "MZNPETF", "NBPGETF", "JSMFETF", "MIIETF"]
+
+
+def fmt_table(df: pd.DataFrame, pct_cols=(), rs_cols=(), dec_cols=()) -> pd.DataFrame:
+    """Numbers as readable text (dash for blanks): percentages, signed rupees, decimals."""
+    out = df.copy()
+
+    def f(fn):
+        return lambda v: "–" if v is None or (isinstance(v, float) and pd.isna(v)) else fn(v)
+    for c in pct_cols:
+        if c in out.columns:
+            out[c] = out[c].map(f(lambda v: f"{v:.0%}" if c == "Winners" else f"{v:+.1%}"))
+    for c in rs_cols:
+        if c in out.columns:
+            out[c] = out[c].map(f(lambda v: f"{v:+,.0f}"))
+    for c in dec_cols:
+        if c in out.columns:
+            out[c] = out[c].map(f(lambda v: f"{v:.1f}"))
+    return out
+
+
+def core_section(prices: dict) -> None:
+    ui.panel("CORE", "Core: hold the market",
+             f"Rs {core_amt:,.0f} of Rs {total_capital:,.0f} · buy once, hold, add monthly")
+    status = swing.index_status(eng.index_hist) if eng.index_hist is not None else {}
+    if status:
+        trend = ('<span class="up">Uptrend</span>' if status["uptrend"] else '<span class="dn">No uptrend</span>')
+        ui.card(ui.cells([
+            ("KSE-100", f"{status['level']:,.0f}", f"close {status['date']:%d %b}"),
+            ("1 month", ui.signed(status["ret_1m"] * 100, 1, "%") if status["ret_1m"] is not None else "–", ""),
+            ("3 months", ui.signed(status["ret_3m"] * 100, 1, "%") if status["ret_3m"] is not None else "–", ""),
+            ("1 year", ui.signed(status["ret_1y"] * 100, 1, "%") if status["ret_1y"] is not None else "–", ""),
+            ("From 1-year high", ui.signed(status["from_high"] * 100, 1, "%"), ""),
+            ("Trend", trend, "close > 20-day > 50-day avg"),
+        ]))
+    else:
+        ui.empty("Loading KSE-100 history…")
+    st.markdown(
+        "**Why a core:** on real PSX prices from 2022 to today, simply holding the KSE-100 beat every trading "
+        "rule we tested, in nearly every year. **How:** buy the basket below (or a KSE-100 style ETF) with your "
+        "core money, keep it through the ups and downs, add new savings each month, and rebalance every 3 months. "
+        "Expect drops: the index fell 23% at one point in the last year.")
+    if core_amt <= 0:
+        return
+    basket = swing.core_basket(eng.index_weights, prices, core_amt, n=8)
+    if basket.empty:
+        ui.empty("Index weights not loaded yet.")
+    else:
+        show = pd.DataFrame({
+            "Symbol": basket["symbol"], "Index weight": basket["weight"].map(lambda v: f"{v:.2f}%"),
+            "Your split": basket["share"].map(lambda v: f"{v:.0%}"), "Price": basket["price"].map(lambda v: f"{v:,.2f}"),
+            "Shares": basket["shares"].map(lambda v: f"{v:,}"), "Cost (Rs)": basket["cost"].map(lambda v: f"{v:,.0f}")})
+        st.dataframe(show, hide_index=True, width="stretch")
+        st.caption(f"The 8 biggest KSE-100 companies, split by their index weight: Rs {basket['cost'].sum():,.0f} "
+                   "invested. Buying costs ≈ 0.3% once; you pay no commission again until you sell. "
+                   "Bigger core = more stocks: change the split in the sidebar.")
+    etf = eng.board[eng.board["symbol"].isin(ETFS)] if eng.board is not None else pd.DataFrame()
+    with st.expander("Or use an ETF (one purchase holds a whole basket)"):
+        st.markdown("ETFs listed on PSX that hold a basket of big stocks. Check each fund's index and fees on its "
+                    "PSX page first; many trade only a few thousand units a day, so use a limit order.")
+        if not etf.empty:
+            cols = [c for c in ("symbol", "current", "change_pct", "volume") if c in etf.columns]
+            st.dataframe(etf[cols].rename(columns={"symbol": "ETF", "current": "Price", "change_pct": "Chg %",
+                                                   "volume": "Volume today"}), hide_index=True, width="stretch")
+        else:
+            st.caption(", ".join(ETFS))
+
+
+def swing_section(board: pd.DataFrame, now: datetime, is_open: bool) -> None:
+    ui.panel("SWING", "Swing setups (satellite)",
+             f"Rs {sw_cfg.capital:,.0f} per trade · buy 3:00–3:27 pm · hold up to {sw_hold} days")
+    if not eng.history_ready():
+        done, tot = eng.hist_progress
+        ui.empty(f"Loading daily price history for the swing rules ({done}/{tot or '…'} stocks). "
+                 "This takes a couple of minutes once a day; refresh shortly.")
+        return
+    status = swing.index_status(eng.index_hist)
+    if not status.get("uptrend"):
+        st.warning("Market filter is off: the KSE-100 isn't in an uptrend (close above its 20-day average and the "
+                   "20-day above the 50-day). No swing buys until it is. In the backtest, trading without this "
+                   "filter lost money.")
+    key = (now.strftime("%Y-%m-%d %H:%M")[:-1], tuple(sorted(sw_cfg.__dict__.items())))
+    cache = st.session_state.get("swing_live")
+    if not cache or cache[0] != key:
+        cand, ok = swing.live_candidates(eng.hist, board, eng.index_hist, None, now.date(), sw_cfg, costs)
+        st.session_state["swing_live"] = (key, cand, ok)
+    _, cand, ok = st.session_state["swing_live"]
+    if cand is None or cand.empty:
+        ui.empty("No swing setups right now. They're checked against today's prices; the decision is made in the "
+                 "last 30 minutes before the close.")
+        return
+    if not ok:
+        with st.expander(f"Watch list: {len(cand)} stocks would qualify if the market were in an uptrend"):
+            for r in cand.head(3).itertuples():
+                ui.swing_card(r)
+        return
+    if is_open and now.time() < (datetime.combine(now.date(), close_t) - pd.Timedelta(minutes=35)).time():
+        st.caption("Early look: these would qualify if the day closed now. Wait for 3:00 pm before buying.")
+    for r in cand.head(3).itertuples():
+        ui.swing_card(r)
+        if st.button("I bought this (swing)", key=f"swbuy-{r.symbol}", icon="✅",
+                     help="Watch it for stop, target, breakeven and the day-4 time stop."):
+            eng.add_position(Position(r.symbol, float(r.entry), int(r.shares), float(r.stop), float(r.target),
+                                      opened=now.strftime("%Y-%m-%d %H:%M"), kind="swing"))
+            st.rerun()
+
+
+def backtest_section() -> None:
+    ui.panel("BACKTEST", "Backtest: swing rules vs holding the market",
+             "Real PSX daily prices · KTrade costs · 15% tax on gains")
+    if not eng.history_ready():
+        ui.empty("Waiting for the price history to load.")
+        return
+    with st.spinner("Running the backtest on 3+ years of prices…"):
+        trades = eng.backtest_trades(costs)
+    last = eng.index_hist["date"].max()
+    yr = pd.DateOffset(years=1)
+    periods = [("Last 12 months", last - yr, None), ("12–24 months ago", last - 2 * yr, last - yr),
+               ("24–36 months ago", last - 3 * yr, last - 2 * yr), ("Last 3 years", last - 3 * yr, None)]
+    tab = swing.period_table(trades, eng.index_hist, periods, sw_cfg.capital)
+    beat = int((tab["Swing return"].iloc[:3] > tab["KSE-100 buy and hold"].iloc[:3]).sum())
+    tone = "go" if beat >= 2 else "stop"
+    ui.card(f'<div class="tb-note"><b>Verdict</b>With your current swing rules, trading beat simply holding the '
+            f'KSE-100 in {beat} of the last 3 years. '
+            + ("Worth paper-testing further." if beat >= 2 else "Holding the market did better: keep most money in the core.")
+            + '</div>', tone)
+    st.dataframe(fmt_table(tab, pct_cols=("Winners", "Swing return", "KSE-100 buy and hold"),
+                           rs_cols=("Avg per trade (Rs)", "Swing result (Rs)", "Holding instead (Rs)")),
+                 hide_index=True, width="stretch")
+    three = trades[trades["date"] >= last - 3 * yr] if trades is not None and not trades.empty else trades
+    port = swing.one_at_a_time(three)
+    eq = swing._equity(port, eng.index_hist, sw_cfg, last - 3 * yr, None)
+    if not eq.empty:
+        eq = eq.rename(columns={"Strategy": "Swing trades (Rs)", "KSE-100 buy and hold": "Holding KSE-100 (Rs)"})
+        st.line_chart(eq.set_index("date")[["Swing trades (Rs)", "Holding KSE-100 (Rs)"]], color=["#FFB020", "#5CC8E8"])
+    if three is not None and not three.empty:
+        bs = swing.by_setup(three)[["setup", "trades", "win_rate", "avg", "net", "avg_days"]].rename(columns={
+            "setup": "Entry type (all setups, last 3 years)", "trades": "Trades", "win_rate": "Winners",
+            "avg": "Avg per trade (Rs)", "net": "Total (Rs)", "avg_days": "Avg days held"})
+        st.dataframe(fmt_table(bs, pct_cols=("Winners",), rs_cols=("Avg per trade (Rs)", "Total (Rs)"),
+                               dec_cols=("Avg days held",)), hide_index=True, width="stretch")
+    st.caption(f"Uses the swing rules in the sidebar: buy at the close, one Rs {sw_cfg.capital:,.0f} position at a "
+               "time, only when the KSE-100 is in an uptrend. On daily prices, a day that touches both the stop and "
+               "the target counts as a stop. Uses today's KSE-100 members, which flatters stock-picking results a "
+               "little. Change the swing rules in the sidebar to test ideas.")
+
+
 # ---------------------------------------------------------------- live section
 @st.fragment(run_every=refresh)
 def live() -> None:
@@ -190,7 +362,8 @@ def live() -> None:
 
     vwaps = eng.vwaps()
     scan = build_scan(board, eng.avg_vol, eng.kse100, vwaps,
-                      eng.session_fraction(now, open_t, close_t), cfg, costs, kse_only)
+                      eng.session_fraction(now, open_t, close_t), cfg, costs, kse_only,
+                      mins_open=eng.mins_open(now, open_t) if is_open else None)
     prices = dict(zip(board["symbol"], board["current"]))
 
     # toasts for alerts the background engine sent since this browser last looked
@@ -209,6 +382,8 @@ def live() -> None:
         st.caption("Market is closed: these are the last available prices. Setups and alerts work during "
                    "trading hours.")
 
+    core_section(prices)
+
     # ---- my position
     ui.panel("POS", "My open position", "Watched for stop, target, breakeven and the close")
     if eng.positions:
@@ -217,7 +392,7 @@ def live() -> None:
             if px is None or pd.isna(px):
                 ui.empty(f"{p.symbol}: no live price right now.")
                 continue
-            pl = (px - p.entry) * p.shares - costs.per_side(p.shares, p.entry) - costs.per_side(p.shares, px)
+            pl = position_pl(p, px, costs, now)
             ui.position_card(p, px, pl)
             if st.button(f"I sold {p.symbol}", key=f"sold-{p.symbol}"):
                 eng.close_position(p.symbol)
@@ -231,23 +406,32 @@ def live() -> None:
             sym = f1.text_input("Symbol").strip().upper()
             entry = f2.number_input("Buy price", 0.0, 100_000.0, 0.0, 0.01)
             shares = f3.number_input("Shares", 0, 10_000_000, 0, 1)
-            f4, f5 = st.columns(2)
+            f4, f5, f6 = st.columns(3)
             stop = f4.number_input("Stop-loss (0 = auto)", 0.0, 100_000.0, 0.0, 0.01)
             target = f5.number_input("Target (0 = auto)", 0.0, 100_000.0, 0.0, 0.01)
+            kind = f6.selectbox("Type", ["Swing (hold days)", "Intraday (sell today)"])
             if st.form_submit_button("Watch this position") and sym and entry > 0 and shares > 0:
-                stop = stop or round(entry * (1 - stop_pct), 2)
-                target = target or round(entry + rr * (entry - stop), 2)
+                is_swing = kind.startswith("Swing")
+                stop = stop or round(entry * (1 - (sw_max_stop if is_swing else stop_pct)), 2)
+                target = target or round(entry + (sw_rr if is_swing else rr) * (entry - stop), 2)
                 eng.add_position(Position(sym, entry, int(shares), stop, target,
-                                          opened=now.strftime("%Y-%m-%d %H:%M")))
+                                          opened=now.strftime("%Y-%m-%d %H:%M"),
+                                          kind="swing" if is_swing else "day"))
                 st.rerun()
+
+    swing_section(board, now, is_open)
 
     # ---- top setups
     top = scan[scan["actionable"]].head(5) if not scan.empty else scan
-    ui.panel("SETUPS", "Top setups now", f"Sized for Rs {capital:,.0f} capital at {position_pct:.0%}")
+    ui.panel("SETUPS", "Intraday setups (paper only)",
+             f"Momentum breakouts in the first {mom_window} min · alerts {'on' if intraday_alerts else 'off'}")
+    st.caption("Intraday signals lost money on paper (17–23 Nov), so treat these as practice: the app paper-trades "
+               "every one and the PAPER panel shows whether they're improving.")
     if scan.empty:
         ui.empty("No stocks pass your filters. Try lowering min volume or turning off KSE-100 only.")
     elif top.empty:
-        ui.empty("No buy setups at the moment. Patience is a position.")
+        ui.empty("No intraday setups right now. Momentum breakouts only count in the first "
+                 f"{mom_window} minutes after the open.")
     for r in top.itertuples():
         ui.setup_card(r)
         if st.button("I bought this", key=f"buy-{r.symbol}", icon="✅",
@@ -299,6 +483,7 @@ def live() -> None:
         ui.empty("Not enough snapshots yet for this stock. The chart fills in during market hours.")
 
 live()
+backtest_section()
 
 
 def paper_section() -> None:
@@ -358,9 +543,16 @@ paper_section()
 with st.expander("How the signals and alerts work"):
     st.markdown(
         f"""
-- **Momentum breakout**: up 1–7% today, volume at least 1.5× its normal pace for this time of day,
-  price in the top quarter of today's range and above VWAP.
-- **VWAP bounce**: green on the day, volume at or above normal pace, price within 0.6% above VWAP.
+- **Strategy (24 Nov): core + satellite.** Most money (the core) is held in the market and not traded. The rest
+  (the satellite) trades swing setups. Backtests on real PSX prices showed holding the KSE-100 beat the trading rules.
+- **Swing breakout**: closes at a new 20-day high on 1.5× its usual volume, near the day's high, up less than 7%.
+- **Swing pullback**: made a 20-day high in the last 2 weeks, dipped back to its 10-day average and closed above it, green on the day.
+- **Swing filters**: only the strongest stocks by 3-month return, at least Rs 50m traded a day, and only when the
+  KSE-100 is in an uptrend. Bought 3:00–3:27 pm; stop below the recent low (2–{sw_max_stop:.0%}); target {sw_rr}× the risk;
+  stop to breakeven at +1× risk; sold at the close of day {sw_hold} if neither is hit.
+- **Intraday momentum breakout** (paper only): up 1–7% today, volume at least 1.5× its normal pace, price in the top
+  quarter of today's range and above VWAP, and only in the first {mom_window} minutes.
+- **VWAP bounce** is now watch-only (0 winners in 36 paper trades).
 - **Volume building**: volume 2× normal but price flat. Watch it; don't buy yet.
 - **Overextended** (up 7%+) and **Falling** (down 3%+) are flagged so you avoid chasing or catching knives.
 - **Stop-loss**: the tightest of VWAP, today's low, or {stop_pct:.1%} below entry, keeping at least 0.5% room,
@@ -368,7 +560,8 @@ with st.expander("How the signals and alerts work"):
   If no stop within {stop_pct:.1%} manages that, the setup shows as **Costs too high - skip**. **Target**: {rr}× the risk.
 - **VWAP** counts only after the app has watched a stock for 45 minutes. Before that (early morning, or after the
   app wakes up mid-day) there are no VWAP bounce signals, because a fresh VWAP sits right on the price.
-- **Costs**: commission max(Rs {comm_min:.2f}/share, {comm:.2%}) + {stax:.0%} sales tax, exchange/CDC fees,
+- **Costs**: commission max(Rs {comm_min:.2f}/share, {comm:.2%}) + {stax:.0%} sales tax on the buy, and on the sell
+  too unless it's the same day (KTrade charges intraday commission on the buy only), exchange/CDC fees,
   and {cgt:.0%} capital gains tax on profit.
 - **Alerts** (ntfy push and/or WhatsApp, checked every minute in market hours): new buy setups (max 3 per scan, once per stock
   per day, paused while you hold a position unless you switch that on); for your position: stop hit → sell,
