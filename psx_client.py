@@ -221,6 +221,15 @@ class PSXClient:
             time.sleep(1 + attempt)
         raise PSXError(f"PSX history failed for {symbol} ({last})")
 
+    def index_weights(self, name: str = "KSE100") -> pd.DataFrame:
+        """Index members with their weight in the index (%), biggest first."""
+        df = parse_table(self._get(f"/indices/{name}"))
+        if "symbol" not in df.columns:
+            return pd.DataFrame(columns=["symbol", "weight"])
+        wcol = next((c for c in df.columns if c.startswith("idx_wtg") or "wtg" in c or "weight" in c), None)
+        df["weight"] = df[wcol].map(_num) if wcol else float("nan")
+        return df[["symbol", "weight"]].sort_values("weight", ascending=False).reset_index(drop=True)
+
     def index_members(self, name: str = "KSE100") -> list[str]:
         df = parse_table(self._get(f"/indices/{name}"))
         return df["symbol"].tolist() if "symbol" in df.columns else []
