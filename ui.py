@@ -249,7 +249,8 @@ def style_scan(show: pd.DataFrame):
     for col in ("Chg %", "Net @ target (Rs)", "Loss @ stop (Rs)"):
         styles[col] = [("text-align:right;color:#22C77A" if v > 0 else "text-align:right;color:#F0475B" if v < 0
                         else "text-align:right") if not pd.isna(v) else "text-align:right" for v in num[col]]
-    sig = {"Momentum breakout": "color:#22C77A;font-weight:600", "VWAP bounce": "color:#22C77A",
+    sig = {"Momentum breakout": "color:#22C77A;font-weight:600", "VWAP bounce - watch": "color:#FFB020",
+           "Momentum - too late": "color:#FFB020",
            "Volume building - watch": "color:#FFB020"}
     styles["Signal"] = [sig.get(v, "color:#F0475B" if str(v).startswith(("Falling", "Over")) else "color:#7D8EA3")
                         for v in num["Signal"]]
@@ -305,3 +306,24 @@ def style_paper(df: pd.DataFrame):
     styles["Result"] = [res.get(v, "") for v in df["Result"]]
     styles["Symbol"] = "color:#FFB020;font-weight:600"
     return disp.style.apply(lambda _: styles, axis=None)
+
+
+def card(inner_html: str, tone: str = "") -> None:
+    st.markdown(f'<div class="tb-card {tone}">{inner_html}</div>', unsafe_allow_html=True)
+
+
+def swing_card(r) -> None:
+    tone = "go" if r.setup == "breakout" else "warn"
+    label = "Breakout" if r.setup == "breakout" else "Pullback"
+    chg_cls = "up" if r.chg > 0 else "dn" if r.chg < 0 else "muted"
+    st.markdown(f"""
+<div class="tb-card {tone}">
+  <div class="tb-card-h"><span class="tb-sym">{esc(r.symbol)}</span><span class="tb-tag {tone}">Swing {label}</span>
+    <span class="tb-sub">#{int(r.rank)} strongest · {r.ret63 * 100:+.0f}% in 3 months</span>
+    <span class="tb-px">{r.entry:,.2f} <span class="{chg_cls}">{r.chg:+.2f}%</span></span></div>
+  {cells([("Buy at", fmt(r.entry), "3:00–3:27 pm"), ("Stop-loss", f'<span class="dn">{fmt(r.stop)}</span>', f"{r.stop_pct:.1f}% below"),
+          ("Target", f'<span class="up">{fmt(r.target)}</span>', ""),
+          ("Shares", f"{int(r.shares):,}", f"Rs {r.shares * r.entry:,.0f}"),
+          ("Net at target", signed(r.net_at_target), "Rs, after costs and tax"),
+          ("Loss at stop", signed(r.loss_at_stop), "Rs, after costs")])}
+</div>""", unsafe_allow_html=True)
