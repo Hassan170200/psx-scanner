@@ -15,12 +15,14 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import requests
 
 from broker_calls import RISK_BUDGET, evaluate as evaluate_call, load_calls
 from psx_client import PSXClient, PSXError
 from paper import PaperBook, day_summary
+import swing
 from signals import ACTIONABLE, VWAP_WARMUP_MIN, Costs, Settings, build_scan, session_vwap
 
 PKT = ZoneInfo("Asia/Karachi")
@@ -124,6 +126,7 @@ class Position:
     target: float
     opened: str = ""
     breakeven_moved: bool = False
+    kind: str = "day"         # "day" = sell by the close; "swing" = hold up to SwingSettings.hold_days
 
     @property
     def risk_per_share(self) -> float:
@@ -147,9 +150,24 @@ def fmt(x: float) -> str:
     return f"{x:,.2f}"
 
 
+def held_days(p: Position, now: datetime) -> int:
+    """Trading days (Mon-Fri) since the position was opened (0 = bought today)."""
+    try:
+        d0 = datetime.strptime(p.opened[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return 0
+    return max(int(np.busday_count(d0, now.date())), 0)
+
+
+def position_pl(p: Position, px: float, costs: Costs, now: datetime | None = None) -> float:
+    """Profit/loss after costs if sold now (same-day sells pay no commission at KTrade)."""
+    same_day = now is not None and p.opened[:10] == now.strftime("%Y-%m-%d")
+    return (px - p.entry) * p.shares - costs.per_side(p.shares, p.entry) - costs.sell_side(p.shares, px, same_day)
+
+
 def evaluate(scan: pd.DataFrame, prices: dict, positions: list[Position], sent: set,
              now: datetime, close_t: dtime, costs: Costs, buy_when_holding: bool = False,
-             max_buy_alerts: int = 3) -> list[Alert]:
+             max_buy_alerts: int = 3, buy_alerts: bool = True, hold_days: int = 4) -> list[Alert]:
     """Pure rules: which alerts to send now. Mutates positions (breakeven stop move)."""
     alerts: list[Alert] = []
 
@@ -158,7 +176,7 @@ def evaluate(scan: pd.DataFrame, prices: dict, positions: list[Position], sent: 
         px = prices.get(p.symbol)
         if px is None or pd.isna(px):
             continue
-        pl = (px - p.entry) * p.shares - costs.per_side(p.shares, p.entry) - costs.per_side(p.shares, px)
+        pl = position_pl(p, px, costs, now)
         if px <= p.stop and f"{p.symbol}-stop" not in sent:
             alerts.append(Alert(f"{p.symbol}-stop", "stop", p.symbol,
                                 f"🔴 <b>SELL {p.symbol} now: stop-loss hit</b>\n"
@@ -173,21 +191,29 @@ def evaluate(scan: pd.DataFrame, prices: dict, positions: list[Position], sent: 
                                 f"Book the profit."))
         elif (not p.breakeven_moved and p.risk_per_share > 0
               and px >= p.entry + p.risk_per_share and f"{p.symbol}-be" not in sent):
-            be = p.entry + 2 * costs.per_side(p.shares, p.entry) / p.shares
+            same_day = p.opened[:10] == now.strftime("%Y-%m-%d")
+            be = p.entry + (costs.per_side(p.shares, p.entry) + costs.sell_side(p.shares, p.entry, same_day)) / p.shares
             p.stop, p.breakeven_moved = round(be, 2), True
             alerts.append(Alert(f"{p.symbol}-be", "breakeven", p.symbol,
                                 f"🔵 <b>{p.symbol}: move stop-loss to {fmt(be)}</b> (breakeven)\n"
                                 f"Price {fmt(px)} is up 1× your risk. Update the stop in KTrade.\n"
                                 f"Target still {fmt(p.target)}."))
     close_dt = now.replace(hour=close_t.hour, minute=close_t.minute, second=0, microsecond=0)
-    if positions and close_dt - timedelta(minutes=15) <= now <= close_dt and "close-soon" not in sent:
-        names = ", ".join(p.symbol for p in positions)
+    closing = close_dt - timedelta(minutes=15) <= now <= close_dt
+    day_pos = [p for p in positions if p.kind != "swing"]
+    if day_pos and closing and "close-soon" not in sent:
+        names = ", ".join(p.symbol for p in day_pos)
         alerts.append(Alert("close-soon", "close_soon", names,
                             f"⏰ <b>Market closes in ~15 min.</b> You still hold {names}.\n"
-                            "Sell now, unless it's closing strong above VWAP and you plan to hold."))
+                            "Sell now: intraday trades are sold the same day (no sell commission today)."))
+    for p in positions:
+        if p.kind == "swing" and closing and held_days(p, now) >= hold_days and f"{p.symbol}-timestop" not in sent:
+            alerts.append(Alert(f"{p.symbol}-timestop", "close_soon", p.symbol,
+                                f"⏰ <b>{p.symbol}: day {held_days(p, now)} of your swing trade.</b>\n"
+                                "Neither stop nor target was hit: sell before the close (time stop)."))
 
     # 2) new buy setups
-    if (not positions or buy_when_holding) and scan is not None and not scan.empty:
+    if buy_alerts and (not positions or buy_when_holding) and scan is not None and not scan.empty:
         held = {p.symbol for p in positions}
         for r in scan[scan["signal"].isin(ACTIONABLE)].head(10).itertuples():
             if len([a for a in alerts if a.kind == "buy"]) >= max_buy_alerts:
@@ -227,7 +253,7 @@ def market_mood(board: pd.DataFrame, kse100: set) -> dict:
 class Engine:
     """Shared state + background loop. One per server process."""
 
-    VERSION = 6  # bump when Engine changes, so a running app swaps in the new one
+    VERSION = 7  # bump when Engine changes, so a running app swaps in the new one
 
     def __init__(self, client: PSXClient | None = None, interval: int = 60) -> None:
         self.client = client or PSXClient()
@@ -257,6 +283,19 @@ class Engine:
         self.hist_cache: dict = {}
         # paper-trading log
         self.paper = PaperBook()
+        # swing (satellite) strategy: daily history for KSE-100 stocks, loaded once a day
+        self.hist: dict = {}                  # symbol -> daily OHLCV
+        self.index_hist: pd.DataFrame | None = None
+        self.index_weights: pd.DataFrame | None = None
+        self.hist_day = None                  # date the history was loaded
+        self.hist_loaded_at: datetime | None = None
+        self.hist_status = ""
+        self.hist_progress = (0, 0)
+        self._hist_thread: threading.Thread | None = None
+        self.swing_live: pd.DataFrame | None = None
+        self.swing_market_ok: bool | None = None
+        self.swing_at = 0.0
+        self.swing_trades: pd.DataFrame | None = None   # backtest trades for the default rules (cached daily)
 
     # -- persistence (best effort; Streamlit Cloud wipes files on redeploy)
     def _load_positions(self) -> list[Position]:
@@ -423,12 +462,118 @@ class Engine:
             return {s: v for s, sn in self.snaps.items()
                     if sn and sn[-1][0] - sn[0][0] >= warmup_min * 60 and (v := session_vwap(sn))}
 
+    @staticmethod
+    def mins_open(now: datetime, open_t: dtime) -> float:
+        start = now.replace(hour=open_t.hour, minute=open_t.minute, second=0, microsecond=0)
+        return (now - start).total_seconds() / 60
+
     def session_fraction(self, now: datetime, open_t: dtime, close_t: dtime) -> float:
         if not market_open(now, open_t, close_t):
             return 1.0
         start = now.replace(hour=open_t.hour, minute=open_t.minute, second=0, microsecond=0)
         end = now.replace(hour=close_t.hour, minute=close_t.minute, second=0, microsecond=0)
         return (now - start) / (end - start)
+
+    # -- swing data
+    def history_ready(self) -> bool:
+        return bool(self.hist) and self.index_hist is not None and not self.index_hist.empty
+
+    def ensure_history(self, now: datetime | None = None, force: bool = False) -> None:
+        """Load ~4 years of daily prices for the KSE-100 stocks in a background thread, once a day
+        (after the close, or at the first use of the day)."""
+        now = now or datetime.now(PKT)
+        if self._hist_thread is not None and self._hist_thread.is_alive():
+            return
+        at = self.hist_loaded_at
+        after_close = dtime(15, 45)
+        fresh = at is not None and at.date() == now.date() and (at.time() >= after_close or now.time() < after_close)
+        if not force and self.history_ready() and fresh:
+            return
+        self._hist_thread = threading.Thread(target=self._load_history, args=(now,), name="psx-history", daemon=True)
+        self._hist_thread.start()
+
+    def _load_history(self, now: datetime) -> None:
+        try:
+            self.refresh_reference()
+            try:
+                w = self.client.index_weights("KSE100")
+                if not w.empty:
+                    self.index_weights = w
+            except PSXError as e:
+                log.warning("index weights: %s", e)
+            members = sorted(self.kse100) or (list(self.index_weights["symbol"]) if self.index_weights is not None else [])
+            cutoff = pd.Timestamp(now.date()) - pd.DateOffset(years=4)
+            self.hist_status = "loading"
+            idx = self.client.history("KSE100")
+            # before the close today's row is still moving: keep completed days only
+            last_day = pd.Timestamp(now.date()) if now.time() >= dtime(15, 45) else pd.Timestamp(now.date()) - pd.Timedelta(days=1)
+            idx = idx[idx["date"] <= last_day]
+            out, fails = {}, []
+            self.hist_progress = (0, len(members))
+            for i, sym in enumerate(members, 1):
+                try:
+                    h = self.client.history(sym)
+                    out[sym] = h[(h["date"] >= cutoff) & (h["date"] <= last_day)].reset_index(drop=True)
+                except PSXError:
+                    fails.append(sym)
+                self.hist_progress = (i, len(members))
+            with self.lock:
+                self.hist, self.index_hist = out, idx[idx["date"] >= cutoff].reset_index(drop=True)
+                self.hist_day, self.hist_loaded_at = now.date(), now
+                self.swing_trades = None
+            self.hist_status = "ready" + (f" ({len(fails)} stocks missing)" if fails else "")
+        except Exception as e:  # never kill the app over history
+            log.exception("history load")
+            self.hist_status = f"error: {e}"
+
+    def swing_settings(self) -> swing.SwingSettings:
+        cfg = self.config or {}
+        return cfg.get("swing") or swing.SwingSettings()
+
+    def backtest_trades(self, costs: Costs | None = None) -> pd.DataFrame | None:
+        """All historical swing setups for the current rules, followed to their exits (cached)."""
+        if not self.history_ready():
+            return None
+        cfg = self.swing_settings()
+        key = (tuple(sorted(cfg.__dict__.items())), self.hist_loaded_at)
+        if self.swing_trades is None or getattr(self, "_swing_key", None) != key:
+            self.swing_trades = swing.prepare(self.hist, self.index_hist, cfg, costs or Costs())
+            self._swing_key = key
+        return self.swing_trades
+
+    def swing_step(self, board: pd.DataFrame, now: datetime, cfg: dict, costs: Costs) -> list[Alert]:
+        """Near the close, look for swing setups using today's live prices; alert the best ones."""
+        if not self.history_ready():
+            return []
+        close_dt = now.replace(hour=cfg["close_t"].hour, minute=cfg["close_t"].minute, second=0, microsecond=0)
+        if not (close_dt - timedelta(minutes=35) <= now <= close_dt - timedelta(minutes=3)):
+            return []
+        if time.time() - self.swing_at < 240 and self.swing_live is not None:
+            return []
+        try:
+            cand, ok = swing.live_candidates(self.hist, board, self.index_hist, None, now.date(),
+                                             self.swing_settings(), costs)
+        except Exception:
+            log.exception("swing live")
+            return []
+        with self.lock:
+            self.swing_live, self.swing_market_ok, self.swing_at = cand, ok, time.time()
+        if not cfg.get("swing_alerts", True) or not ok or cand is None or cand.empty:
+            return []
+        if any(p.kind == "swing" for p in self.positions) and not cfg.get("buy_when_holding"):
+            return []
+        alerts = []
+        for r in cand.head(2).itertuples():
+            key = f"{r.symbol}-swing"
+            if key in self.sent:
+                continue
+            alerts.append(Alert(key, "buy", r.symbol,
+                                f"📈 <b>Swing {r.setup}: {r.symbol}</b> (satellite)\n"
+                                f"Buy ≈ {fmt(r.entry)} before the close · Stop {fmt(r.stop)} ({r.stop_pct:.1f}%) · "
+                                f"Target {fmt(r.target)}\n{int(r.shares):,} shares · At target Rs {r.net_at_target:+,.0f} "
+                                f"· At stop Rs {r.loss_at_stop:,.0f}\nHold up to {self.swing_settings().hold_days} days. "
+                                "Unproven rules: small money only."))
+        return alerts
 
     # -- loop
     def tick(self, now: datetime | None = None) -> list[Alert]:
@@ -446,6 +591,7 @@ class Engine:
         if board is None:
             return []
         self.refresh_reference()
+        self.ensure_history(now)
         if not is_open:
             return []
         self.record(board, now.timestamp())
@@ -453,14 +599,16 @@ class Engine:
         costs: Costs = cfg["costs"]
         scan = build_scan(board, self.avg_vol, self.kse100, self.vwaps(),
                           self.session_fraction(now, cfg["open_t"], cfg["close_t"]),
-                          settings, costs, cfg["kse_only"])
+                          settings, costs, cfg["kse_only"], mins_open=self.mins_open(now, cfg["open_t"]))
         prices = dict(zip(board["symbol"], board["current"]))
         self.refresh_calls(cfg.get("calls_url", ""))
         broker = self.broker_alerts(prices, costs, now)
         broker += self.paper_step(scan, prices, costs, now, cfg, market_mood(board, self.kse100))
+        broker += self.swing_step(board, now, cfg, costs)
         with self.lock:
             alerts = evaluate(scan, prices, self.positions, self.sent, now, cfg["close_t"], costs,
-                              cfg.get("buy_when_holding", False)) + broker
+                              cfg.get("buy_when_holding", False), buy_alerts=cfg.get("intraday_alerts", False),
+                              hold_days=self.swing_settings().hold_days) + broker
             if any(a.kind == "breakeven" for a in alerts):
                 self.save_positions()
         for a in alerts:
