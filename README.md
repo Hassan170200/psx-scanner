@@ -70,6 +70,26 @@ Shows trade calls from your broker's WhatsApp channels with a sense check: live 
 - **Paste a call:** copy a broker message from WhatsApp and paste it to add it instantly.
 - Push alerts: a new call appears, the price enters the buy zone, TP1 is hit, or the stop is hit.
 
+## Strategy: core + satellite (24 Nov 2026)
+
+A backtest on real PSX daily prices (2022 to Nov 2026, KTrade costs, 15% tax on gains) found that simply
+holding the KSE-100 beat every trading rule tested, in nearly every year. So the app now splits your money:
+
+- **Core (default 80%)**: buy and hold the market. The CORE panel suggests the 8 biggest KSE-100 companies split by
+  index weight (or a PSX-listed ETF), and shows the KSE-100's trend and returns. Add savings monthly; rebalance every
+  3 months.
+- **Satellite (the rest)**: swing trades held 2–5 days, signalled in the last 30 minutes of the day (SWING panel,
+  push alerts 3:00–3:27 pm). Only the strongest stocks by 3-month return, only when the KSE-100 is in an uptrend.
+  Breakout (new 20-day high on strong volume) or pullback (dip to the 10-day average after a breakout). Stop below
+  the recent low (2–5%), target 2× the risk, breakeven at +1× risk, sold at the close of day 4.
+- **BACKTEST panel**: runs the swing rules in the sidebar on ~3 years of real prices and compares them with holding
+  the KSE-100, year by year. Change the rules in the sidebar to test ideas before risking money.
+- **Intraday** signals are paper-only now (they lost money on paper 17–23 Nov): momentum breakouts in the first
+  45 minutes only, VWAP bounce is watch-only, intraday buy alerts are off by default. Same-day sells are charged no
+  commission (KTrade's intraday pricing).
+
+The app loads daily price history for the KSE-100 stocks once a day (about two minutes, in the background).
+
 ## Paper trades (does the scanner actually make money?)
 
 From the first market day the app logs every buy setup as a paper trade: bought at the setup's price with the
