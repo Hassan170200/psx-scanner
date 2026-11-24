@@ -89,8 +89,9 @@ class PaperTrade:
 
 
 def net_result(entry: float, exit_px: float, shares: int, costs: Costs) -> float:
-    """Rupees after both sides' costs, and capital gains tax on a profit."""
-    pre = (exit_px - entry) * shares - costs.per_side(shares, entry) - costs.per_side(shares, exit_px)
+    """Rupees after costs (buy commission; same-day sell without commission) and capital gains tax on a profit."""
+    # paper trades are always sold the same day they're bought: no sell commission at KTrade
+    pre = (exit_px - entry) * shares - costs.per_side(shares, entry) - costs.sell_side(shares, exit_px, same_day=True)
     return round(pre * (1 - costs.cgt) if pre > 0 else pre, 0)
 
 
@@ -345,12 +346,23 @@ class PaperBook:
         except requests.RequestException as e:
             self.remote_error = f"Backup failed: {e.__class__.__name__}"
 
+    def reprice(self, costs: Costs) -> None:
+        """Recompute closed trades' net with the current cost model (e.g. after the 24 Nov
+        change to commission-free same-day sells), so old and new trades compare fairly."""
+        with self.lock:
+            for t in self.trades:
+                if t.status != "open" and t.exit_px is not None:
+                    t.net = net_result(t.entry, t.exit_px, t.shares, costs)
+            self._repriced = True
+
     # -- rules
     def update(self, scan: pd.DataFrame | None, prices: dict, now: datetime, costs: Costs,
                entry_cutoff: dtime = ENTRY_CUTOFF, exit_time: dtime = EXIT_TIME,
                market: dict | None = None) -> list[PaperTrade]:
         """Open new paper trades from the scan, move open ones on. Returns taken trades opened or
         closed now (skipped setups are followed silently). `market` = {"mkt_chg", "breadth"}."""
+        if not getattr(self, "_repriced", False):
+            self.reprice(costs)
         day, hm = now.date().isoformat(), now.strftime("%H:%M")
         market = market or {}
         events: list[PaperTrade] = []
@@ -384,7 +396,8 @@ class PaperBook:
                 elif now.time() >= exit_time:
                     self._close(t, "time", px, hm, costs)
                 elif not t.be_moved and t.risk > 0 and px >= t.entry + t.risk:
-                    be = t.entry + 2 * costs.per_side(t.shares, t.entry) / max(t.shares, 1)
+                    be = t.entry + (costs.per_side(t.shares, t.entry)
+                                    + costs.sell_side(t.shares, t.entry, same_day=True)) / max(t.shares, 1)
                     t.stop_now, t.be_moved = round(be, 2), True
                 if t.status != "open":
                     changed = True
